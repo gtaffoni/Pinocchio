@@ -679,23 +679,29 @@ int allocate_main_memory()
   source_3LPT_2 = kvector_3LPT_2;
 #endif
 #endif
+
+  second_derivatives = (double *)(main_memory + count_memory);
+  size_t count_second_derivatives = 0;
   for (igrid=0; igrid<Ngrids; igrid++)
     {
       for (i=0; i<6; i++)
 	{
-	  second_derivatives[igrid][i] = (double *)(main_memory + count_memory);
 	  count_memory += MyGrids[igrid].total_local_size * sizeof(double);	  
 	  ALIGN_MEMORY_BLOCK( count_memory );
+	  count_second_derivatives += MyGrids[igrid].total_local_size;
 	}
+
       for (i=0; i<3; i++)
-	first_derivatives[igrid][i] = second_derivatives[igrid][i];
-      density[igrid] = second_derivatives[igrid][0];
+	{
+	  first_derivatives[igrid][i] = GET_P_SECOND_DERIVATIVES(igrid, i, 0);
+	}
+      density[igrid] = GET_P_SECOND_DERIVATIVES(igrid, 0, 0);
     }
 
 #if defined(GPU_OMP_FULL)
   
   // Map the 2D part of the second_derivatives array
-  #pragma omp target enter data map(alloc: second_derivatives[0:Ngrids][0:6]) device(devID)
+  #pragma omp target enter data map(alloc: second_derivatives[0: count_second_derivatives]) device(devID)
 
   // Check if the 2D array part is present on the GPU
   if (!omp_target_is_present(second_derivatives, devID)) 
@@ -704,50 +710,13 @@ int allocate_main_memory()
     return -1;
   }
 
-  for (int igrid = 0; igrid < Ngrids; igrid++) {
-    for (int i = 0; i < 6; i++) {
-        #pragma omp target enter data map(alloc: second_derivatives[igrid][i][0: MyGrids[igrid].total_local_size]) device(devID)
-    }
-  }
-  
-  // After all entries have been mapped, check if all slices are present on the device
-  bool all_allocated = true; 
-
-  for (int igrid = 0; igrid < Ngrids; igrid++) {
-    for (int i = 0; i < 6; i++) {
-        if (!omp_target_is_present(second_derivatives[igrid][i], devID)) {
-            printf("ERROR: second_derivatives[%d][%d] is not present on the device!\n", igrid, i);
-            all_allocated = false;
-            break; // Exit the loop if any slice is not allocated
-        }
-    }
-    if (!all_allocated) {
-        break; // Exit the outer loop if any slice check failed
-    }
-  }
-
-  // Print success message if everything is allocated successfully
-  if (all_allocated) {
-      printf("\n\t GPU %d second_derivatives memory successfully allocated on the device.\n", devID);
-  }
-
 #endif
 
-//  for (igrid=0; igrid<Ngrids; igrid++)
-//    {
-//      seedtable[igrid] = (unsigned int*)(main_memory + count_memory);
-//      count_memory += MyGrids[igrid].GSglobal[_x_] * MyGrids[igrid].GSglobal[_y_] * sizeof(unsigned int);
-//    }
-//
   /* allocates fft vectors */
   for (igrid=0; igrid<Ngrids; igrid++)
     {
       rvector_fft[igrid] = pfft_alloc_real(MyGrids[igrid].total_local_size_fft);
       cvector_fft[igrid] = pfft_alloc_complex(MyGrids[igrid].total_local_size_fft/2);
-      //printf("Task %d has got alignment for grid %d [ %llu %llu %llu  -  %llu %llu %llu ]\n", 
-    //ThisTask, igrid, (unsigned long long int)rvector_fft[igrid] % 256, (unsigned long long int)rvector_fft[igrid] % 128, (unsigned long long int)rvector_fft[igrid] % 64,
-    //(unsigned long long int)cvector_fft[igrid] % 256, (unsigned long long int)cvector_fft[igrid] % 128, (unsigned long long int)cvector_fft[igrid] % 64);
-    
 
       if (rvector_fft[igrid] == 0x0 || cvector_fft[igrid] == 0x0)
 	{
@@ -776,16 +745,25 @@ int allocate_main_memory()
   for (igrid=1; igrid<Ngrids; igrid++)
     bcast[n++]=(size_t)((void*)kdensity[igrid]-(void*)kdensity[igrid-1]);
 #ifdef TWO_LPT
-  bcast[n++]=(size_t)((void*)kvector_2LPT-(void*)second_derivatives[Ngrids-1][0]);
+
+  bcast[n++]=(size_t)((void*)kvector_2LPT-(void*)GET_P_SECOND_DERIVATIVES(Ngrids-1, 0, 0));
   bcast[n++]=(size_t)((void*)seedtable[0]-(void*)kvector_2LPT);
+
 #else
-  bcast[n++]=(size_t)((void*)seedtable[0]-(void*)second_derivatives[Ngrids-1][0]);
+
+  bcast[n++]=(size_t)((void*)seedtable[0]-(void*)GET_P_SECOND_DERIVATIVES(Ngrids-1, 0, 0));
+
 #endif
-  bcast[n++]=(size_t)((void*)second_derivatives[0][0]-(void*)kdensity[Ngrids-1]);
+
+  bcast[n++]=(size_t)((void*)GET_P_SECOND_DERIVATIVES(0, 0, 0)-(void*)kdensity[Ngrids-1]);
+ 
   for (igrid=1; igrid<Ngrids; igrid++)
-    bcast[n++]=(size_t)((void*)second_derivatives[igrid][0]-(void*)second_derivatives[igrid-1][0]);
-  /* for (igrid=1; igrid<Ngrids; igrid++) */
-  /*   bcast[n++]=(size_t)((void*)seedtable[igrid]-(void*)seedtable[igrid-1]); */
+    {
+
+      bcast[n++]=(size_t)((void*)GET_P_SECOND_DERIVATIVES(igrid, 0, 0)-(void*)GET_P_SECOND_DERIVATIVES(igrid - 1, 0, 0));
+
+    }
+
   bcast[n++]=0;
   bcast[n++]=(size_t)(last-(void*)seedtable[Ngrids-1]);
   bcast[n++]=(size_t)(last-(void*)products);
