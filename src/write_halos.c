@@ -644,10 +644,8 @@ int write_PLC(int flag)
 	      writethis.Mass=plcgroups[i].Mass*params.ParticleMass*hfactor;
 	      writethis.theta=theta;
 	      writethis.phi=phi;
-	      v_los=(plcgroups[i].x[0]*plcgroups[i].v[0]+
-		     plcgroups[i].x[1]*plcgroups[i].v[1]+
-		     plcgroups[i].x[2]*plcgroups[i].v[2])/rhor;
-              writethis.obsz=plcgroups[i].z+v_los/SPEEDOFLIGHT*(1.0+plcgroups[i].z);
+	      v_los=(plcgroups[i].x[0]*plcgroups[i].v[0] + plcgroups[i].x[1]*plcgroups[i].v[1] + plcgroups[i].x[2]*plcgroups[i].v[2])/rhor;
+          writethis.obsz=plcgroups[i].z+v_los/SPEEDOFLIGHT*(1.0+plcgroups[i].z);
 #ifndef LIGHT_OUTPUT
 	      writethis.vx=plcgroups[i].v[0];
 	      writethis.vy=plcgroups[i].v[1];
@@ -655,7 +653,7 @@ int write_PLC(int flag)
 	      writethis.x=plcgroups[i].x[0]*hfactor;
 	      writethis.y=plcgroups[i].x[1]*hfactor;
 	      writethis.z=plcgroups[i].x[2]*hfactor;
-              writethis.v_los=v_los;
+          writethis.v_los=v_los;
 #endif
 
 	      idummy=sizeof(plc_write_data);
