@@ -90,7 +90,8 @@ int initialization_gpu_omp()
 
   /* set the device number: one-to-one correspondence between MPI process and accelerator */
   hostID = omp_get_initial_device();
-  devID  = (host_rank % numdev);
+  //devID  = (host_rank % numdev);
+  devID  = (omp_get_num_devices() == 1 ? 0 : host_rank % numdev);
 
   /* free the MPI subgroup */
   MPI_Comm_free(&host_comm);
@@ -562,12 +563,12 @@ int set_grids()
   kdensity=(double**)malloc(Ngrids * sizeof(double*));
   density=(double**)malloc(Ngrids * sizeof(double*));
   first_derivatives=(double***)malloc(Ngrids * sizeof(double**));
-  second_derivatives=(double***)malloc(Ngrids * sizeof(double**));
+  /* second_derivatives=(double***)malloc(Ngrids * sizeof(double**)); */
 
   for (igrid=0; igrid<Ngrids; igrid++)
     {
       first_derivatives[igrid]=(double**)malloc(3 * sizeof(double*));
-      second_derivatives[igrid]=(double**)malloc(6 * sizeof(double*));
+      /* second_derivatives[igrid]=(double**)malloc(6 * sizeof(double*)); */
     }
   /* moved to GenIC */
   /* seedtable=(unsigned int**)malloc(Ngrids * sizeof(unsigned int*)); */
