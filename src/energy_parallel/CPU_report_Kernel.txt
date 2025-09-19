@@ -1,0 +1,16 @@
+######################################################################
+			[PMT MPI NUMA REPORT]
+	TOTAL NUMBER OF PROCESSES: 2
+		NUMBER OF NODES: 1
+			NUMBER OF PROCESSES PER NODE: 2
+				NUMBER OF SOCKETS PER NODE: 1
+					NUMBER OF PROCESSES PER SOCKET: 2
+######################################################################
+
+
+
+				[NODE 0]
+[TOTAL PER NODE]:       0.148271 [S];   4.63024 [J];   31.7746 [W];
+
+
+
