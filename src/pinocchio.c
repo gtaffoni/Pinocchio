@@ -1,78 +1,82 @@
 /*****************************************************************
- *                        PINOCCHIO  V5.1                        *
- *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  *
- *****************************************************************
+/*  *                        PINOCCHIO  V5.1                        * */
+/*  *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  * */
+/*  ***************************************************************** */
  
- This code was written by
- Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan, 
- Chiara Moretti, Luca Tornatore, David Goz, Tiago Castro
- Copyright (C) 2025
+/*  This code was written by */
+/*  Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan,  */
+/*  Chiara Moretti, Luca Tornatore, David Goz, Tiago Castro */
+/*  Copyright (C) 2025 */
  
- github: https://github.com/pigimonaco/Pinocchio
- web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html
+/*  github: https://github.com/pigimonaco/Pinocchio */
+/*  web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html */
  
- This program is free software; you can redistribute it and/or modify
- it under the terms of the GNU General Public License as published by
- the Free Software Foundation; either version 2 of the License, or
- (at your option) any later version.
+/*  This program is free software; you can redistribute it and/or modify */
+/*  it under the terms of the GNU General Public License as published by */
+/*  the Free Software Foundation; either version 2 of the License, or */
+/*  (at your option) any later version. */
  
- This program is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- GNU General Public License for more details.
+/*  This program is distributed in the hope that it will be useful, */
+/*  but WITHOUT ANY WARRANTY; without even the implied warranty of */
+/*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the */
+/*  GNU General Public License for more details. */
  
- You should have received a copy of the GNU General Public License
- along with this program; if not, write to the Free Software
- Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-*/
+/*  You should have received a copy of the GNU General Public License */
+/*  along with this program; if not, write to the Free Software */
+/*  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+/* *\/ */
 
 
-#include "pinocchio.h"
-#include "def_splines.h"
+ #include "pinocchio.h" 
+ #include "def_splines.h" 
 
-void abort_code(void);
-void write_cputimes(void);
+void abort_code(void); 
+void write_cputimes(void); 
 
-int main(int argc, char **argv, char **envp)
-{
-  /* Initialize MPI */
-  int got_level;
-  MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &got_level); // Hybrid MPI and OPENMP parallel
-  MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask); // gives you your rank i.e. ID
-  MPI_Comm_size(MPI_COMM_WORLD, &NTasks); // size of your pool 
+int main(int argc, char **argv, char **envp) 
+ { 
+   /*   /\* Initialize MPI *\/ */
+   int got_level; 
+   MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &got_level); // Hybrid MPI and OPENMP parallel 
+   MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask); // gives you your rank i.e. ID 
+   MPI_Comm_size(MPI_COMM_WORLD, &NTasks); // size of your pool  
 
-#if defined(MPI_ATTACH_DEBUGGER)
-  mpi_attach_debugger(MPI_COMM_WORLD);
-#endif // MPI_ATTACH_DEBUGGER
+  #if defined(MPI_ATTACH_DEBUGGER) 
+   mpi_attach_debugger(MPI_COMM_WORLD); 
+    #endif // MPI_ATTACH_DEBUGGER 
   
-#ifdef _OPENMP
-  /* initialization of OpemMP */
-#pragma omp parallel
-  {
-#pragma omp master
-    internal.nthreads_omp = omp_get_num_threads();
-  }
-#endif
+  #ifdef _OPENMP 
+   /*   /\* initialization of OpemMP *\/ */
+  #pragma omp parallel 
+   { 
+    #pragma omp master 
+     internal.nthreads_omp = omp_get_num_threads(); 
+   } 
+  #endif 
 
-  /* GPU initialization */
-#if defined(GPU_OMP) || defined(GPU_OMP_FULL)
-  if (initialization_gpu_omp())
-    abort_code();
+   /*   /\* GPU initialization *\/ */
+  #if defined(GPU_OMP) || defined(GPU_OMP_FULL) 
+   if (initialization_gpu_omp()) 
+     abort_code(); 
 
-  PMT_CREATE(&devID, 1, ThisTask, NTasks);
+  #if defined(_NVIDIA_) 
+  // PMT_CREATE(&ThisTask, 1); 
+  #else 
+  //  PMT_CREATE(NULL,0); 
+  #endif //_NVIDIA 
   
-#else
+  #else
 
-  // Init PMT
-  PMT_CREATE(NULL, 0, ThisTask, NTasks);
+   // Init PMT
+  //  PMT_CREATE(NULL,0);
+  
+  #endif // GPU_OMP || FULL_GPU_OMP
 
-#endif // GPU_OMP || FULL_GPU_OMP
-
-  /* PMT measures */
-  PMT_CPU_START("total", ThisTask);
-#if defined(GPU_OMP) || defined(GPU_OMP_FULL)
-  PMT_GPU_START("total", devID, ThisTask);
-#endif // GPU_OMP || FULL_GPU_OMP
+   /* PMT measures */
+   //PMT_CPU_START("total");
+  #if defined(GPU_OMP) || defined(GPU_OMP_FULL)
+   //PMT_GPU_START("total", devID);
+  #endif // GPU_OMP || FULL_GPU_OMP
    
   /* timing of the code */  
   cputime.total=MPI_Wtime();
@@ -271,13 +275,23 @@ int main(int argc, char **argv, char **envp)
     write_cputimes();
 
   /* PMT measures */
-  PMT_CPU_STOP("total", ThisTask);
+  //PMT_CPU_STOP("total");
 #if defined(GPU_OMP) || defined(GPU_OMP_FULL) 
 // #ifdef GPU_OMP
-  PMT_GPU_STOP("total", devID, ThisTask);
+  //PMT_GPU_STOP("total", devID);
 #endif // GPU_OMP
+
+  
+  // PMT_CPU_SHOW("collapse_time_CPU");
+  // PMT_GPU_SHOW("collapse_time_GPU", devID);
+
+  // PMT_FREE();
+
+  //PMT_CPU_SHOW("total");
+  //PMT_GPU_SHOW("total", devID);
   
   /* PMT report */
+  /*
   for (int Task=0 ; Task<NTasks ; Task++)
     {
       if (Task == ThisTask)
@@ -295,7 +309,7 @@ int main(int argc, char **argv, char **envp)
 	}      
       MPI_Barrier(MPI_COMM_WORLD);
     }
-  
+  */
   /* done */
   if (!ThisTask)
     printf("Pinocchio done!\n");
