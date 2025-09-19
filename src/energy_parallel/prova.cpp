@@ -1,0 +1,18 @@
+#include <iostream>
+#include <pmt/NVML.h>
+#include <unistd.h>
+
+int main()
+{
+  std::unique_ptr<pmt::PMT> sensor = pmt::nvml::NVML::Create(0);
+    //std::unique_ptr<pmt::pmt> sensor(pmt::nvml::NVML::create());
+  pmt:: State start, end;
+  start = sensor->Read();
+  sleep(5);
+  end = sensor->Read();
+  std::cout << sensor->joules(start, end) << " [J]" << std::endl;
+  std::cout << sensor->watts(start, end) << " [W]" << std::endl;
+  std::cout << sensor->seconds(start, end) << " [S]" << std::endl;
+
+  return 0;
+}

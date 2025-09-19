@@ -65,29 +65,28 @@ int compute_LPT_displacements(int compute_sources, double redshift)
 	  {
 	      
 	    /* HERE IT WILL BE NECESSARY TO SUM DIFFERENT SOURCES IF MULTIPLE GRIDS ARE USED */
-	      
 	    /* source term for 2LPT */
-	    source_2LPT[index] = 
-	      second_derivatives[0][0][index] * second_derivatives[0][1][index] +
-	      second_derivatives[0][0][index] * second_derivatives[0][2][index] +
-	      second_derivatives[0][1][index] * second_derivatives[0][2][index] -
-	      second_derivatives[0][3][index] * second_derivatives[0][3][index] -
-	      second_derivatives[0][4][index] * second_derivatives[0][4][index] -
-	      second_derivatives[0][5][index] * second_derivatives[0][5][index];
-		
+	    source_2LPT[index] =
+	      GET_SECOND_DERIVATIVES(0, 0, index) * GET_SECOND_DERIVATIVES(0, 1, index) +
+	      GET_SECOND_DERIVATIVES(0, 0, index) * GET_SECOND_DERIVATIVES(0, 2, index) +
+	      GET_SECOND_DERIVATIVES(0, 1, index) * GET_SECOND_DERIVATIVES(0, 2, index) -
+	      GET_SECOND_DERIVATIVES(0, 3, index) * GET_SECOND_DERIVATIVES(0, 3, index) -
+	      GET_SECOND_DERIVATIVES(0, 4, index) * GET_SECOND_DERIVATIVES(0, 4, index) -
+	      GET_SECOND_DERIVATIVES(0, 5, index) * GET_SECOND_DERIVATIVES(0, 5, index);
+	    		
 #ifdef THREE_LPT
-	    source_3LPT_1[index] = 3.0 *(second_derivatives[0][0][index]*
-					 (second_derivatives[0][1][index]*second_derivatives[0][2][index]
-					  -second_derivatives[0][5][index]*second_derivatives[0][5][index])
-					 - second_derivatives[0][3][index]*
-					 (second_derivatives[0][3][index]*second_derivatives[0][2][index]
-					  -second_derivatives[0][4][index]*second_derivatives[0][5][index])
-					 + second_derivatives[0][4][index]*
-					 (second_derivatives[0][3][index]*second_derivatives[0][5][index]
-					  -second_derivatives[0][4][index]*second_derivatives[0][1][index]));
+	    source_3LPT_1[index] = 3.0 *(GET_SECOND_DERIVATIVES(0, 0, index) *
+					 (GET_SECOND_DERIVATIVES(0, 1, index) * GET_SECOND_DERIVATIVES(0, 2, index)
+					  - GET_SECOND_DERIVATIVES(0, 5, index) * GET_SECOND_DERIVATIVES(0, 5, index))
+					 - GET_SECOND_DERIVATIVES(0, 3, index) *
+					 (GET_SECOND_DERIVATIVES(0, 3, index) * GET_SECOND_DERIVATIVES(0, 2, index)
+					  - GET_SECOND_DERIVATIVES(0, 4, index) * GET_SECOND_DERIVATIVES(0, 5, index))
+					 + GET_SECOND_DERIVATIVES(0, 4, index) *
+					 (GET_SECOND_DERIVATIVES(0, 3, index) * GET_SECOND_DERIVATIVES(0, 5, index)
+					  - GET_SECOND_DERIVATIVES(0, 4, index) * GET_SECOND_DERIVATIVES(0, 1, index)));
 		
 	    source_3LPT_2[index] = 2.0 *     /* this factor is needed because nabla2phi is half the theoretical one */
-	      (second_derivatives[0][0][index] + second_derivatives[0][1][index] + second_derivatives[0][2][index]) * 
+	      (GET_SECOND_DERIVATIVES(0, 0, index) + GET_SECOND_DERIVATIVES(0, 1, index) + GET_SECOND_DERIVATIVES(0, 2, index)) * 
 	      source_2LPT[index];
 #endif
 	  }
@@ -132,9 +131,11 @@ int compute_LPT_displacements(int compute_sources, double redshift)
 #pragma omp for nowait
 #endif
 	      for (int index=0; index<MyGrids[0].total_local_size; index++)
-		/* the first 2 factor is needed because nabla2phi is half the theoretical one */
-		source_3LPT_2[index] -= 2.0 * (ider<=3? 1.0 : 2.0) *
-		  rvector_fft[0][index] * second_derivatives[0][ider-1][index];
+		{
+		  /* the first 2 factor is needed because nabla2phi is half the theoretical one */		  
+		  source_3LPT_2[index] -= 2.0 * (ider<=3 ? 1.0 : 2.0) *
+		    rvector_fft[0][index] * GET_SECOND_DERIVATIVES(0, ider-1, index);
+		}
 #ifdef _OPENMP
 	    }
 #endif

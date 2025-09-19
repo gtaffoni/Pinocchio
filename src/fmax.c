@@ -174,15 +174,20 @@ int compute_fmax(void)
                                            gpu_products.Fmax[0:MyGrids[0].total_local_size], \
                                            gpu_products) device(devID)
 
-   for (int igrid = 0; igrid < Ngrids; igrid++) 
-   {
-    for (int i = 0; i < 6; i++) 
-    {
-      #pragma omp target exit data map(delete: second_derivatives[igrid][i][0: MyGrids[igrid].total_local_size]) device(devID)
-    }
-   }
+  /*  for (int igrid = 0; igrid < Ngrids; igrid++)  */
+  /*  { */
+  /*   for (int i = 0; i < 6; i++)  */
+  /*   { */
+  /*     #pragma omp target exit data map(delete: second_derivatives[igrid][i][0: MyGrids[igrid].total_local_size]) device(devID) */
+  /*   } */
+  /*  } */
  
-  #pragma omp target exit data map(delete: second_derivatives[0:Ngrids][0:6]) device(devID)
+  /* #pragma omp target exit data map(delete: second_derivatives[0:Ngrids][0:6]) device(devID) */
+  size_t count_second_derivatives = 0;
+  for (int igrid=0 ; igrid<Ngrids ; igrid++)
+    count_second_derivatives += (6 * MyGrids[igrid].total_local_size);
+
+  #pragma omp target exit data map(delete: second_derivatives[0: count_second_derivatives]) device(devID)
   
   /*-------------------- Free GPU Splines and Smoothing -------------------------- */
   #pragma omp target exit data map(delete: Smoothing.Radius[0:Smoothing.Nsmooth],  \
@@ -351,7 +356,8 @@ int compute_second_derivatives(double R, int ThisGrid)
 	  return 1;
 
 	tmp = MPI_Wtime();
-	write_from_rvector(ThisGrid, second_derivatives[ThisGrid][ider-1]);
+	/* write_from_rvector(ThisGrid, second_derivatives[ThisGrid][ider-1]); */
+	write_from_rvector(ThisGrid, GET_P_SECOND_DERIVATIVES(ThisGrid, ider-1, 0));
 	timetmp += MPI_Wtime() - tmp;
       }
 

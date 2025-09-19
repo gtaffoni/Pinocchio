@@ -54,7 +54,7 @@ unsigned int   *cubes_ordering;
 double **kdensity;
 double **density;
 double ***first_derivatives;
-double ***second_derivatives;
+double *second_derivatives;
 #if defined(GPU_OMP) 
 gpu_second_derivatives_data gpu_second_derivatives;
 #endif // GPU_OMP

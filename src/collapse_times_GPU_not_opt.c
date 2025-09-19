@@ -352,7 +352,8 @@ int compute_collapse_times_gpu(int ismooth)
     for (int i=tid ; i<6 ; i+=thr)
       {
 	omp_target_memcpy((void *)internal.device.gpu_main_memory, 
-			  (void *)second_derivatives[0][i],
+			  /* (void *)second_derivatives[0][i], */
+			  (void *)GET_P_SECOND_DERIVATIVES(0, i, 0),
 			  (total_size * sizeof(double)),
 			  (internal.device.memory_second_derivatives.offset + internal.device.memory_second_derivatives.tensor[i]),
 			  0,

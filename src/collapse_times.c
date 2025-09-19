@@ -522,7 +522,7 @@ int compute_collapse_times(int ismooth)
     }
   
   /* PMT measure */
-  PMT_CPU_START("collapse_time_CPU", ThisTask);
+//   PMT_CPU_START("collapse_time_CPU");
   /* timing the main loop of 'compute_collapse_times' function */
   double cputmp = MPI_Wtime();
   /*-----------------------------------------------------------------------------------*/
@@ -540,7 +540,8 @@ int compute_collapse_times(int ismooth)
       double diff_ten[6]; 
       for (int i=0 ; i<6 ; i++)
 	{
-	  diff_ten[i] = second_derivatives[0][i][index];
+	  /* diff_ten[i] = second_derivatives[0][i][index]; */
+	  diff_ten[i] = GET_SECOND_DERIVATIVES(0, i, index);
 	}
         
       /* Computation of the variance of the linear density field */
@@ -563,7 +564,13 @@ int compute_collapse_times(int ismooth)
     } // target region  
 
   /* ------------- Updates cpu collapse time for a single threads -----------------------------*/
-   
+
+  /* CPU collapse time */	
+  cputime.coll += (MPI_Wtime() - cputmp);
+
+  /* PMT measures */
+//   PMT_CPU_STOP("collapse_time_CPU");
+  
   /* Fail check during computation of the inverse collapse time */
   /* If there were failures, an error message is printed and the function returns 1 */
   if (all_fails)
@@ -595,11 +602,6 @@ int compute_collapse_times(int ismooth)
   /* Stores the true variance*/
   Smoothing.TrueVariance[ismooth] = global_variance;
 
-  /* CPU collapse time */	
-  cputime.coll += (MPI_Wtime() - cputmp);
-
-  /* PMT measures */
-  PMT_CPU_STOP("collapse_time_CPU", ThisTask);
   
   return 0;
 

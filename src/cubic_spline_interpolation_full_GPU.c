@@ -23,6 +23,44 @@ CubicSpline *custom_cubic_spline_alloc(const int size)
   return spline;
 }
 
+void solve_natural_spline_tridiagonal_system(const double *x, const double *y, double *d2y, int n) {
+    double *a   = malloc((n - 2) * sizeof(double));
+    double *b   = malloc((n - 2) * sizeof(double));
+    double *c   = malloc((n - 2) * sizeof(double));
+    double *rhs = malloc((n - 2) * sizeof(double));
+
+    // Step sizes
+    for (int i = 1; i < n - 1; i++) {
+        double h1  = x[i] - x[i - 1];
+        double h2  = x[i + 1] - x[i];
+        a[i - 1]   = h1 / 6.0;
+        b[i - 1]   = (h1 + h2) / 3.0;
+        c[i - 1]   = h2 / 6.0;
+        rhs[i - 1] = (y[i + 1] - y[i]) / h2 - (y[i] - y[i - 1]) / h1;
+    }
+
+    // Forward elimination
+    for (int i = 1; i < n - 2; i++) {
+        double  m = a[i] / b[i - 1];
+        b[i]   -= m * c[i - 1];
+        rhs[i] -= m * rhs[i - 1];
+    }
+
+    // Back substitution
+    d2y[0]     = 0.0;            // Natural boundary
+    d2y[n - 1] = 0.0;            // Natural boundary
+    d2y[n - 2] = rhs[n - 3] / b[n - 3];
+
+    for (int i = n - 4; i >= 0; i--) {
+        d2y[i + 1] = (rhs[i] - c[i] * d2y[i + 2]) / b[i];
+    }
+
+    free(a);
+    free(b);
+    free(c);
+    free(rhs);
+}
+
 void custom_cubic_spline_init(CubicSpline  *const restrict spline, 
                               const double *const restrict x_data, 
                               const double *const restrict y_data, 
@@ -38,17 +76,20 @@ void custom_cubic_spline_init(CubicSpline  *const restrict spline,
       spline->d2y_data[size - 1] = 0.0;  // Boundary condition
     }
     
-    // Compute second derivatives
-    #pragma omp target teams distribute parallel for device(devID)
-    for (int i = 1; i < size - 1; i++)
-      {
-        const double h1  = (spline->x[i + 0] - spline->x[i - 1]);
-        const double h2  = (spline->x[i + 1] - spline->x[i - 0]);
-        const double dy1 = (spline->y[i + 0] - spline->y[i - 1]);
-        const double dy2 = (spline->y[i + 1] - spline->y[i - 0]);
+    // Compute second derivatives on CPU
+    solve_natural_spline_tridiagonal_system(x_data, y_data, spline->d2y_data, size);
 
-        spline->d2y_data[i] = 6.0 / (h1 + h2) * ((dy2 / h2) - (dy1 / h1));
-      }
+    // Compute second derivatives
+    // #pragma omp target teams distribute parallel for device(devID)
+    // for (int i = 1; i < size - 1; i++)
+    //   {
+    //     const double h1  = (spline->x[i + 0] - spline->x[i - 1]);
+    //     const double h2  = (spline->x[i + 1] - spline->x[i - 0]);
+    //     const double dy1 = (spline->y[i + 0] - spline->y[i - 1]);
+    //     const double dy2 = (spline->y[i + 1] - spline->y[i - 0]);
+
+    //     spline->d2y_data[i] = 6.0 / (h1 + h2) * ((dy2 / h2) - (dy1 / h1));
+    //   }
 
     // Compute coefficients
     #pragma omp target teams distribute parallel for device(devID)

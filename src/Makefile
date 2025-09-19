@@ -41,14 +41,15 @@ EXEC         ?= pinocchio.x
 # Compilation options
 
 # C compiler
-COMPILER_CC  ?= nvc
-COMPILER_CPP ?= nvc++
+COMPILER_CC  ?= mpicc
+COMPILER_CPP ?= mpic++
 DEBUG        ?= NO
 OMP          ?= YES
 GPU          ?= NO
 FULL_GPU     ?= YES
 SCOREP       ?= NO
 NSIGHT       ?= NO
+ENERGY_PARALLEL ?= NO
 ENERGY_CPU   ?= NO
 ENERGY_GPU   ?= NO
 ####################################################################
@@ -129,13 +130,12 @@ ENERGY = NO
 
 ifeq ($(ENERGY_CPU), YES)
 ENERGY = YES
-OPTIONS += -D_ENERGY_RAPL_   # switch-on CPU power measurements through RAPL counters
+OPTIONS += -D_MPICH_   # switch-on CPU power measurements through RAPL counters
 endif
 
 ifeq ($(ENERGY_GPU), YES)
 ENERGY   = YES
 OPTIONS += -D_ENERGY_NVIDIA_ # switch-on NVIDIA GPU power measurements
-# OPTIONS += -D_ENERGY_AMD_    # switch-on AMD GPU power measurements
 endif
 
 ifeq ($(ENERGY), YES)
@@ -153,13 +153,12 @@ GPU_FLAG =
 
 ifeq ($(GPU), YES)
 OPTIONS += -DGPU_OMP
-GPU_FLAG = -gpu=ccnative -target=gpu -gpu=nomanaged
+GPU_FLAG = -gpu=ccnative -target=gpu
 endif
 
 ifeq ($(FULL_GPU), YES)
 OPTIONS += -DGPU_OMP_FULL
-# GPU_FLAG = -gpu=ccnative -target=gpu -gpu=nomanaged
-GPU_FLAG =
+GPU_FLAG = -mp=gpu -target=gpu -gpu=ccnative
 endif
 
 ifeq ($(NSIGHT), YES)
@@ -215,14 +214,11 @@ ifeq ($(SYSTYPE), LeonardoBoost)
 CDEBUG      = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
 COPTIMIZED  = -O3 -fast -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
 
-MPI         = /leonardo/prod/opt/libraries/openmpi/4.1.6/nvhpc--24.3/
-MPI_LIBR    = -L$(MPI)/lib -lmpi
-MPI_INCL    = -I$(MPI)/include
-
 LIBDIR      = /leonardo_scratch/fast/CNHPC_1498509/lib/nvhpc-23.11
 FFTW        = $(LIBDIR)/fftw/fftw-3.3.10
 FFTW_LIBR   = -L$(FFTW)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
 FFTW_INCL   = -I$(FFTW)/include
+
 
 GSL         = $(LIBDIR)/gsl/gsl-2.7.1
 GSL_LIBR    = -L$(GSL)/lib -lgsl -lgslcblas -lm
@@ -233,9 +229,39 @@ PFFT_LIBR   = -L$(PFFT)/lib -lpfft
 PFFT_INCL   = -I$(PFFT)/include
 
 
-PMT         = /leonardo_scratch/fast/CNHPC_1498509/lib/pmt/local
-PMT_LIBR    = -L$(PMT)/lib64 -lpmt
-PMT_INCL    = -I$(PMT)/include
+endif
+
+ifeq ($(SYSTYPE), Magellanus)
+
+CDEBUG      = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
+COPTIMIZED  = -O3 -fast -Minfo=all -v -Mneginfo -march=native -mtune=native -fomit-frame-pointer $(GPU_FLAG) $(OMP_FLAG)
+#COPTIMIZED  = -O3 -march=native -mtune=native -fomit-frame-pointer -ftree-vectorize $(GPU_FLAG) $(OMP_FLAG)
+#COPTIMIZED  = -g -O3 -march=native -mtune=native $(GPU_FLAG) $(OMP_FLAG)
+#COPTIMIZED      = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
+
+##################### DA CAMBIARE ###############################
+# GPU_FLAG   = -gpu=ccnative,debug,lineinfo -target=gpu -gpu=nomanaged
+# OMP_FLAG   = -mp=multicore,gpu
+# COPTIMIZED = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
+##############################################################
+
+LIBDIR      = /data/NVC_LIB
+FFTW        = $(LIBDIR)/FFT_lib/fftw-3.3.10/local
+FFTW_LIBR   = -L$(FFTW)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
+FFTW_INCL   = -I$(FFTW)/include
+
+GSL         = $(LIBDIR)/gsl-2.8/local
+GSL_LIBR    = -L$(GSL)/lib -lgsl -lgslcblas -lm
+GSL_INCL    = -I$(GSL)/include
+
+PFFT        = $(LIBDIR)/FFT_lib/pfft/pfft-1.0.8-alpha/local
+PFFT_LIBR   = -L$(PFFT)/lib -lpfft
+PFFT_INCL   = -I$(PFFT)/include
+
+
+PMT         = /space/Giovanni/Pinocchio_dev/Pinocchio_parallel_pmt/src/energy_parallel
+PMT_LIBR    = -L$(PMT) -lpmt_parallel
+PMT_INCL    = -I$(PMT)
 
 endif
 
@@ -291,14 +317,10 @@ OBJECTS = fmax.o  variables.o  cubic_spline_interpolation.o cubic_spline_interpo
 	ReadParamfile.o allocations.o LPT.o distribute.o collapse_times.o collapse_times_GPU.o \
 	fragment.o build_groups.o write_halos.o write_snapshot.o pinocchio.o mpi_debugger.o
 
-ifeq ($(ENERGY), YES)
-OBJECTS += energy_pmt_methods.o
-endif
-
 # Main targets and rules
 
 $(EXEC): $(OBJECTS) Makefile
-	$(SCOREP_FLAG) $(COMPILER) $(COPTS) $(OPTIONS) -o $(RUNDIR)$(EXEC) $(OBJECTS) $(LIB)
+	$(SCOREP_FLAG) $(COMPILER) -lstdc++ $(COPTS) $(OPTIONS) -o $(RUNDIR)$(EXEC) $(OBJECTS) $(LIB)
 	ldd $(RUNDIR)$(EXEC)
 
 run_planner: $(OBJECTS) run_planner.o Makefile
@@ -306,11 +328,11 @@ run_planner: $(OBJECTS) run_planner.o Makefile
 
 # Generic rule for compiling source files #
 
-energy_pmt_methods.o: energy/energy_pmt_methods.cpp Makefile energy/energy_pmt_methods.h energy/energy_pmt.h
+#energy_pmt_methods.o: energy_parallel/energy_pmt_methods.cpp Makefile energy_parallel/energy_pmt_methods.h energy_parallel/energy_pmt.h
 	# g++ -std=c++17 $(OPTIONS) $(PMT_INCL) -c $< -o $@
-	$(COMPILER_CPP) -std=c++17 $(OPTIONS) $(PMT_INCL) -c $< -o $@
+#	$(COMPILER_CPP) -std=c++17 $(OPTIONS) $(PMT_INCL) -c $< -o $@
 
-%.o: %.c Makefile pinocchio.h def_splines.h
+%.o: %.c Makefile pinocchio.h def_splines.h 
 	$(SCOREP_FLAG) $(COMPILER_CC) $(INC) $(COPTS) $(OPTIONS) -c $<
 
 
