@@ -504,7 +504,7 @@ void sort_and_organize(void)
   if (!ThisTask)
     printf("[%s] Starting sorting (parallel radix sort)\n",fdate());
 
-  /* Sort 1: sort particles in order of descending Fmax.
+  /* Sort particles in order of descending Fmax.
      Uses group_ID as scratch buffer for indices (it will be zeroed later).
      Uses sorted_pos (cast to unsigned int) as scratch for keys.
      Uses indicesY as scratch for keys during double-buffering. */
@@ -513,26 +513,29 @@ void sort_and_organize(void)
 				   subbox.Nstored);
 
   /* inverse permutation needed by the in-place reorder */
-  for (i=0; i<subbox.Nstored; i++)
+  for (i=0; i<(int)subbox.Nstored; i++)
     indicesY[indices[i]]=i;
 
   /* reorder the frag data structure and frag_pos in order of descending Fmax */
   reorder(indicesY, subbox.Nstored);
 
-  /* Sort 2: sort particles in order of ascending position.
-     Same scratch buffers as above. */
-  parallel_radix_sort_by_position_asc(frag_pos, indices, indicesY,
-				      (unsigned int *)sorted_pos, group_ID,
-				      subbox.Nstored);
+  /* Build direct lookup table: sorted_pos[grid_position] = fmax_order_index.
+     This replaces the previous Sort 2 + bsearch approach with O(1) access.
+     After this, find_location() returns the fmax-order index directly,
+     eliminating the need for both the position sort and the indices[] indirection.
+     Requires Nalloc >= Npart so that sorted_pos can hold Npart entries. */
+  if (subbox.Nalloc < subbox.Npart)
+    {
+      printf("ERROR on Task %d: Nalloc (%u) < Npart (%u), cannot build direct lookup table.\n",
+	     ThisTask, subbox.Nalloc, subbox.Npart);
+      printf("       Please increase MaxMemPerParticle.\n");
+      fflush(stdout);
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
-  /* create a vector sorted_pos with sorted positions and pointers to it */
-  for (i=0; i<subbox.Nstored; i++)
-    sorted_pos[i]=frag_pos[i];
-
-  /* reorder the sorted vector */
-  for (i=0; i<subbox.Nstored; i++)
-    indicesY[indices[i]]=i;
-  reorder_nofrag(indicesY,subbox.Nstored);
+  memset(sorted_pos, -1, subbox.Npart * sizeof(int));
+  for (i=0; i<(int)subbox.Nstored; i++)
+    sorted_pos[frag_pos[i]] = i;
 
   tmp=MPI_Wtime()-tmp;
   cputime.sort+=tmp;
@@ -616,15 +619,11 @@ void reorder_nofrag(int *ind, int n)
 
 int find_location(int i,int j,int k)
 {
-  /* this function finds the location in the frag and frag_pos vectors of a given particle */
+  /* Returns the fmax-order index of the particle at grid position (i,j,k),
+     or -1 if the particle is not stored.
+     Uses the direct lookup table built in sort_and_organize(). */
 
-  int pos = COORD_TO_INDEX(i,j,k,subbox.Lgwbl);
-    //i + (j + k*subbox.Lgwbl[_y_])*subbox.Lgwbl[_x_];
-  int *nn=bsearch((void*)&pos,(void*)sorted_pos,(size_t)subbox.Nstored,sizeof(int),compare_search);
-  if (nn!=0x0)
-    return nn-sorted_pos;
-  else
-    return -1; /* if the particle is not stored, it returns -1 */
+  return sorted_pos[COORD_TO_INDEX(i,j,k,subbox.Lgwbl)];
 }
 
 
@@ -701,7 +700,7 @@ int count_peaks(int *ngood)
 	  /* looks for the neighbouring particle in the list */
 	  int pos = find_location(i1,j1,k1);
 	  if (pos>=0)
-	    peak_cond &= (frag[iz].Fmax > frag[indices[pos]].Fmax);
+	    peak_cond &= (frag[iz].Fmax > frag[pos].Fmax);
 #endif
 
 	  if (!peak_cond)

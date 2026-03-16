@@ -318,8 +318,8 @@ int build_groups(int Npeaks, double zstop, int first_call)
               pos = find_location(i1,j1,k1);
               if (pos>=0)
                 {
-                  neigh[nn] = group_ID[indices[pos]];
-                  peak_cond &= (frag[iz].Fmax > frag[indices[pos]].Fmax);
+                  neigh[nn] = group_ID[pos];
+                  peak_cond &= (frag[iz].Fmax > frag[pos].Fmax);
                 }
               else
                 neigh[nn] = 0;
@@ -335,7 +335,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
 #ifdef CLASSIC_FRAGMENTATION
                   fil_list[nf][3]=pos;
 #else
-                  fil_list[nf][3]=indices[pos];
+                  fil_list[nf][3]=pos;
 #endif
                   nf++;
                 }
@@ -1985,8 +1985,8 @@ int quick_build_groups(int Npeaks)
               pos = find_location(i1,j1,k1);
               if (pos>=0)
                 {
-                  neigh[nn] = group_ID[indices[pos]];
-                  peak_cond &= (frag[iz].Fmax > frag[indices[pos]].Fmax);
+                  neigh[nn] = group_ID[pos];
+                  peak_cond &= (frag[iz].Fmax > frag[pos].Fmax);
                 }
               else
                 neigh[nn] = 0;
@@ -1997,7 +1997,7 @@ int quick_build_groups(int Npeaks)
                   fil_list[nf][0]=i1;
                   fil_list[nf][1]=j1;
                   fil_list[nf][2]=k1;
-                  fil_list[nf][3]=indices[pos];
+                  fil_list[nf][3]=pos;
                   nf++;
                 }
 

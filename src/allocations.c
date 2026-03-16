@@ -217,7 +217,8 @@ int organize_main_memory()
     ;
 
 
-#ifdef CLASSIC_FRAGMENTATION
+  /* Nalloc >= Npart is required: in classic mode for direct particle indexing,
+     in default mode for the direct position-to-index lookup table (sorted_pos). */
   if (myNalloc<subbox.Npart)
     {
       printf("ERROR: Task %d can allocate only %d subbox particles, while %d are needed;\n",
@@ -225,7 +226,6 @@ int organize_main_memory()
       printf("       a large overhead is probably needed, please increase MaxMemPerParticle\n");
       return (size_t)0;
     }
-#endif
 
   /* this is the largest amount of memory needed by the code */
   memory.all_allocated = (memory.first_allocated > memory.frag_allocated ? memory.first_allocated : memory.frag_allocated);
