@@ -205,7 +205,7 @@ endif
 
 OBJECTS = fmax.o variables.o initialization.o collapse_times.o fmax-pfft.o GenIC.o \
 	ReadParamfile.o allocations.o LPT.o distribute.o \
-	fragment.o build_groups.o write_halos.o write_snapshot.o cosmo.o
+	fragment.o build_groups.o parallel_sort.o write_halos.o write_snapshot.o cosmo.o
 
 # Main targets and rules
 

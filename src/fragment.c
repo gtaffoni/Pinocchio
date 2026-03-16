@@ -28,6 +28,7 @@
 
 
 #include "pinocchio.h"
+#include "parallel_sort.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -328,11 +329,11 @@ int fragment()
       /* sorting of particles according to their collapse time */
       tmp=MPI_Wtime();
       if (!ThisTask)
-	printf("[%s] Starting sorting\n",fdate());
+	printf("[%s] Starting sorting (parallel radix sort)\n",fdate());
 
-      for (int i=0; i<subbox.Npart; i++)
-	*(indices+i)=i;
-      qsort((void *)indices, subbox.Npart, sizeof(int), index_compare_F);
+      parallel_radix_sort_by_fmax_desc(frag, indices, indicesY,
+				       (unsigned int *)sorted_pos, group_ID,
+				       subbox.Npart);
 
       tmp=MPI_Wtime()-tmp;
       cputime.sort+=tmp;
@@ -501,22 +502,29 @@ void sort_and_organize(void)
 
   tmp=MPI_Wtime();
   if (!ThisTask)
-    printf("[%s] Starting sorting\n",fdate());
+    printf("[%s] Starting sorting (parallel radix sort)\n",fdate());
 
-  /* sort particles in order of descending Fmax */
-  for (i=0; i<subbox.Nstored; i++)
-    *(indices+i)=i;
-  qsort((void *)indices, subbox.Nstored, sizeof(int), index_compare_F);
+  /* Sort 1: sort particles in order of descending Fmax.
+     Uses group_ID as scratch buffer for indices (it will be zeroed later).
+     Uses sorted_pos (cast to unsigned int) as scratch for keys.
+     Uses indicesY as scratch for keys during double-buffering. */
+  parallel_radix_sort_by_fmax_desc(frag, indices, indicesY,
+				   (unsigned int *)sorted_pos, group_ID,
+				   subbox.Nstored);
 
-  /* this is needed to reorder */
+  /* inverse permutation needed by the in-place reorder */
   for (i=0; i<subbox.Nstored; i++)
     indicesY[indices[i]]=i;
 
   /* reorder the frag data structure and frag_pos in order of descending Fmax */
   reorder(indicesY, subbox.Nstored);
 
-  /* sort particles in order of ascending position */
-  qsort((void *)indices, subbox.Nstored, sizeof(int), index_compare_P);
+  /* Sort 2: sort particles in order of ascending position.
+     Same scratch buffers as above. */
+  parallel_radix_sort_by_position_asc(frag_pos, indices, indicesY,
+				      (unsigned int *)sorted_pos, group_ID,
+				      subbox.Nstored);
+
   /* create a vector sorted_pos with sorted positions and pointers to it */
   for (i=0; i<subbox.Nstored; i++)
     sorted_pos[i]=frag_pos[i];
