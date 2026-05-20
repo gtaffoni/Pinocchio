@@ -30,7 +30,7 @@
 #include "pinocchio.h"
 #include <gsl/gsl_interp2d.h>
 #include <gsl/gsl_spline2d.h>
-#include <immintrin.h>
+//#include <immintrin.h>
 
 /*------------------------------------------------------- Macros declaration --------------------------------------------------------*/
 
