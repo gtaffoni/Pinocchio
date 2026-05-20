@@ -614,6 +614,13 @@ int build_groups(int,double,int);
 int quick_build_groups(int);
 int update_map(unsigned int *);
 
+/* GFLUT and pre-computation prototypes (build_groups.c) */
+void gflut_init(double, double);
+void gflut_validate(void);
+void precomp_allocate(int);
+void precomp_free(void);
+void precompute_particles(void);
+
 // RIMETTERE LA LETTURA DEL WHITE NOISE
 //#ifdef WHITENOISE
 //int read_white_noise(void);
