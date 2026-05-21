@@ -2,25 +2,25 @@
 # *                        PINOCCHIO  V5.1                        *
 # *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  *
 # *****************************************************************
-# 
+#
 # This code was written by
-# Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan, 
+# Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan,
 # Chiara Moretti, Luca Tornatore, David Goz, Tiago Castro
 # Copyright (C) 2025
-# 
+#
 # github: https://github.com/pigimonaco/Pinocchio
 # web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html
-# 
+#
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation; either version 2 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
@@ -34,14 +34,22 @@ RUNDIR = ./
 
 EXEC = pinocchio.x
 
-# Compilation options #
+# -----------------------------------------------------------------------
+# Build toggles (override from command line, e.g. make OMP=YES GPU=YES)
+# -----------------------------------------------------------------------
 
-DEBUG = NO
-OMP   = NO
+DEBUG    ?= NO
+OMP      ?= NO
+# USE_HEFFTE: set to YES to use HeFFTe backend instead of pfft
+USE_HEFFTE ?= NO
+# GPU: enable OpenMP GPU offload (requires USE_HEFFTE=YES and nvc compiler)
+GPU      ?= NO
+# FULL_GPU: all FFT on GPU (GPU_OMP_FULL), implies USE_HEFFTE=YES
+FULL_GPU ?= NO
 
-########## Preprocessor Definitions ########## 
+########## Preprocessor Definitions ##########
 
-# Displacement LPT order # 
+# Displacement LPT order #
 
 OPTIONS += -DTWO_LPT
 OPTIONS += -DTHREE_LPT
@@ -79,23 +87,67 @@ OPTIONS += -DELL_CLASSIC
 # OPTIONS += -DMOD_GRAV_FR
 # OPTIONS += -DFR0=1.e-8
 
-# Other options # 
+# Other options #
 
 # OPTIONS += -DWHITENOISE
 OPTIONS += -DNORADIATION
 
 
-########## Preprocessor Definitions end ########## 
+########## Preprocessor Definitions end ##########
 
-# OpenMP Configuration #
+# -----------------------------------------------------------------------
+# FFT Backend Selection
+# USE_HEFFTE=YES selects HeFFTe; default keeps pfft.
+# FULL_GPU=YES forces USE_HEFFTE=YES (HeFFTe is the only GPU-capable backend).
+# -----------------------------------------------------------------------
+
+ifeq ($(FULL_GPU), YES)
+USE_HEFFTE = YES
+endif
+
+ifeq ($(GPU), YES)
+USE_HEFFTE = YES
+endif
+
+# -----------------------------------------------------------------------
+# GPU OpenMP offload flags
+# -----------------------------------------------------------------------
+
+ifeq ($(GPU), YES)
+OPTIONS  += -DGPU_OMP
+GPU_FLAG  = -gpu=ccnative -target=gpu
+endif
+
+ifeq ($(FULL_GPU), YES)
+OPTIONS  += -DGPU_OMP_FULL
+GPU_FLAG  = -gpu=ccnative -target=gpu
+endif
+
+# -----------------------------------------------------------------------
+# HeFFTe preprocessor flag
+# -----------------------------------------------------------------------
+
+ifeq ($(USE_HEFFTE), YES)
+OPTIONS += -DUSE_HEFFTE
+endif
+
+# -----------------------------------------------------------------------
+# OpenMP Configuration
+# -----------------------------------------------------------------------
 
 ifeq ($(OMP), YES)
-OPTIONS += -DUSE_FFT_THREADS
-OMP_FLAG = -fopenmp
-OMP_FFTW = -lfftw3_omp -lfftw3_threads
+OPTIONS  += -DUSE_FFT_THREADS
+OMP_FFTW  = -lfftw3_omp -lfftw3_threads
+ifeq ($(GPU), YES)
+OMP_FLAG  = -mp=multicore,gpu
+else ifeq ($(FULL_GPU), YES)
+OMP_FLAG  = -mp=multicore,gpu
 else
-OMP_FLAG =
-OMP_FFTW =
+OMP_FLAG  = -fopenmp
+endif
+else
+OMP_FLAG  =
+OMP_FFTW  =
 endif
 
 ########## System-specific Configuration ############
@@ -148,7 +200,7 @@ COPTIMIZED  = -O2 -Wno-unused-result  $(OMP_FLAG)
 FFTW_LIBR   = -L$(HOME)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
 FFTW_INCL   = -I$(HOME)/include
 PFFT_LIBR   = -lpfft
-PFFT_INCL   = 
+PFFT_INCL   =
 MPI_LIBR    = -L$(SMPI_ROOT)/lib -lmpi_ibm
 MPI_INCL    = -I$(SMPI_ROOT)/include
 GSL_LIBR    = -L$(GSL_LIB) -lgsl -lgslcblas -lm
@@ -172,12 +224,16 @@ GSL_INCL    = -I/opt/cluster/spack/opt/spack/linux-centos7-broadwell/gcc-11.2.0/
 endif
 
 
-###################### LEONARDO ######################
+###################### LEONARDO (HeFFTe + NVHPC) ######################
+# SYSTYPE=LeonardoBoost  USE_HEFFTE=YES  GPU=YES  or  FULL_GPU=YES
+# Compiler: nvc (NVIDIA HPC SDK)
+# Libraries: HeFFTe, FFTW, GSL, OpenMPI 4.1.6
+
 ifeq ($(SYSTYPE), "LeonardoBoost")
 
 CC          =  nvc
-CDEBUG      = -g -O0 -Minfo=all -v -Mneginfo $(OMP_FLAG)
-COPTIMIZED  = -O3 -fast -Minfo=all -v -Mneginfo $(OMP_FLAG)
+CDEBUG      = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
+COPTIMIZED  = -O3 -fast -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
 
 MPI         = /leonardo/prod/opt/libraries/openmpi/4.1.6/nvhpc--24.3/
 MPI_LIBR    = -L$(MPI)/lib -lmpi
@@ -188,14 +244,17 @@ FFTW        = $(LIBDIR)/fftw/fftw-3.3.10
 FFTW_LIBR   = -L$(FFTW)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
 FFTW_INCL   = -I$(FFTW)/include
 
-GSL         = $(LIBDIR)/gsl/gsl-2.7.1
-GSL_LIBR    = -L$(GSL)/lib -lgsl -lgslcblas -lm
-GSL_INCL    = -I$(GSL)/include
-
 PFFT        = $(LIBDIR)/pfft/pfft
 PFFT_LIBR   = -L$(PFFT)/lib -lpfft
 PFFT_INCL   = -I$(PFFT)/include
 
+HEFFTE_DIR  = /leonardo/pub/userexternal/dgoz0000/libraries
+HEFF_LIBR   = -L$(HEFFTE_DIR)/heffte_nvidia/lib64 -lheffte
+HEFF_INCL   = -I$(HEFFTE_DIR)/heffte_nvidia/include
+
+GSL         = $(LIBDIR)/gsl/gsl-2.7.1
+GSL_LIBR    = -L$(GSL)/lib -lgsl -lgslcblas -lm
+GSL_INCL    = -I$(GSL)/include
 
 PMT         = /leonardo_scratch/fast/CNHPC_1498509/lib/pmt/local
 PMT_LIBR    = -L$(PMT)/lib64 -lpmt
@@ -204,15 +263,21 @@ PMT_INCL    = -I$(PMT)/include
 endif
 
 
-########## System-specific Configuration end ########## 
+########## System-specific Configuration end ##########
 
-# Include paths for libraries #
+# -----------------------------------------------------------------------
+# Aggregate include and library paths.
+# - For the pfft (default CPU) path: use PFFT + FFTW.
+# - For the heffte path: use HEFF + FFTW (still needed for thread init).
+# -----------------------------------------------------------------------
 
-INC =  $(PFFT_INCL) $(FFTW_INCL) $(MPI_INCL) $(GSL_INCL)
-
-# Library flags #
-
-LIB =  -lm $(PFFT_LIBR) $(FFTW_LIBR) $(MPI_LIBR) $(GSL_LIBR)
+ifeq ($(USE_HEFFTE), YES)
+INC = $(HEFF_INCL) $(FFTW_INCL) $(MPI_INCL) $(GSL_INCL)
+LIB = -lm $(HEFF_LIBR) $(FFTW_LIBR) $(MPI_LIBR) $(GSL_LIBR)
+else
+INC = $(PFFT_INCL) $(FFTW_INCL) $(MPI_INCL) $(GSL_INCL)
+LIB = -lm $(PFFT_LIBR) $(FFTW_LIBR) $(MPI_LIBR) $(GSL_LIBR)
+endif
 
 # Compiler options : choose from CDEBUG or COPTIMIZED #
 
@@ -221,19 +286,47 @@ COPTS = $(CDEBUG)
 else
 COPTS = $(COPTIMIZED)
 endif
-# Source files #
 
-OBJECTS = fmax.o variables.o initialization.o collapse_times.o fmax-pfft.o GenIC.o \
+# -----------------------------------------------------------------------
+# Source files
+#
+# Default (CPU pfft path): fmax-pfft.o + parallel_sort.o
+# HeFFTe path (USE_HEFFTE=YES): fmax-heffte.o  (no pfft, keep parallel_sort)
+# GPU path: additionally includes collapse_times_GPU.o,
+#           cubic_spline_interpolation.o, cubic_spline_interpolation_full_GPU.o
+# -----------------------------------------------------------------------
+
+# Base objects (always compiled)
+OBJECTS_BASE = fmax.o variables.o initialization.o collapse_times.o GenIC.o \
 	ReadParamfile.o allocations.o LPT.o distribute.o \
 	fragment.o build_groups.o parallel_sort.o write_halos.o write_snapshot.o cosmo.o
+
+# FFT backend object: heffte or pfft
+ifeq ($(USE_HEFFTE), YES)
+FFT_OBJ = fmax-heffte.o
+else
+FFT_OBJ = fmax-pfft.o
+endif
+
+# GPU-specific objects (compiled only when GPU or FULL_GPU)
+GPU_OBJECTS =
+ifeq ($(GPU), YES)
+GPU_OBJECTS += collapse_times_GPU.o cubic_spline_interpolation.o
+endif
+ifeq ($(FULL_GPU), YES)
+GPU_OBJECTS += collapse_times_GPU.o cubic_spline_interpolation.o \
+               cubic_spline_interpolation_full_GPU.o
+endif
+
+OBJECTS = $(OBJECTS_BASE) $(FFT_OBJ) $(GPU_OBJECTS)
 
 # Main targets and rules
 
 pinocchio: $(OBJECTS) pinocchio.o Makefile
-	$(CC) $(INC) $(COPTS) -o $(RUNDIR)$(EXEC) pinocchio.o $(OBJECTS) $(LIB)
+	$(CC) $(INC) $(COPTS) $(OPTIONS) -o $(RUNDIR)$(EXEC) pinocchio.o $(OBJECTS) $(LIB)
 
 run_planner: $(OBJECTS) run_planner.o Makefile
-	$(CC) $(INC) $(COPTS) -o run_planner run_planner.o $(OBJECTS) $(LIB)	
+	$(CC) $(INC) $(COPTS) -o run_planner run_planner.o $(OBJECTS) $(LIB)
 
 # Generic rule for compiling source files #
 
@@ -245,4 +338,33 @@ run_planner: $(OBJECTS) run_planner.o Makefile
 clean:
 	\rm -f *.o *~ $(EXEC) run_planner
 
+###############################################################
+# Documentation
+###############################################################
+# Generates HTML docs from in-source Doxygen comments.
+#
+# Usage:
+#   make docs            # builds HTML docs under ../docs/build/html
+#   make docs-clean      # removes generated docs
+#
+# Requirements:
+#   - doxygen installed and available on PATH
+#   - config: ../docs/Doxyfile (provided in repo)
 
+.PHONY: docs docs-clean
+
+DOXYGEN ?= doxygen
+DOCDIR  ?= ../docs
+DOXYCFG ?= $(DOCDIR)/Doxyfile
+
+docs:
+	@command -v $(DOXYGEN) >/dev/null 2>&1 || { \
+	  echo "Error: doxygen not found. Install doxygen and re-run 'make docs'."; \
+	  exit 1; \
+	}
+	@echo "Generating documentation with $$( $(DOXYGEN) --version )..."
+	@cd $(DOCDIR) && $(DOXYGEN) Doxyfile
+	@echo "Docs available at $(DOCDIR)/build/html/index.html"
+
+docs-clean:
+	@rm -rf $(DOCDIR)/build

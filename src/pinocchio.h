@@ -41,10 +41,32 @@
 #include <gsl/gsl_integration.h>
 #include <gsl/gsl_odeiv2.h>
 #include <gsl/gsl_spline.h>
+#ifdef USE_HEFFTE
+/* HeFFTe backend: replaces pfft for multi-backend FFT (CPU FFTW or GPU CUFFT/ROCFFT) */
+#include <heffte.h>
+/* Choose HeFFTe backend at compile time */
+#if defined(GPU_OMP_FULL)
+#define BACKEND Heffte_BACKEND_CUFFT
+#else
+#define BACKEND Heffte_BACKEND_FFTW
+#endif
+/* If threading is active and not in full-GPU mode, also need FFTW header */
+#if defined(_OPENMP) && !defined(GPU_OMP_FULL)
+#include <fftw3.h>
+#endif
+#else
+/* Legacy pfft backend */
 #include <fftw3-mpi.h>
 #include <pfft.h>
+#endif /* USE_HEFFTE */
+
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+/* Custom cubic spline (required for GPU_OMP and GPU_OMP_FULL paths) */
+#if defined(CUSTOM_INTERPOLATION) || defined(GPU_OMP) || defined(GPU_OMP_FULL)
+#include "cubic_spline_interpolation.h"
 #endif
 
 /* this library is used to vectorize the computation of collapse times */
@@ -128,6 +150,16 @@
 #if defined(MOD_GRAV_FR) && defined(FR0)
 #warning "You have correctly compiled the code for the modified gravity scenario. However, please keep in mind that the modified gravity run (MOD_GRAV_FR) is still under development, and this mode should be used with extreme caution as it may not be fully stable. If you are unsure about its usage, please contact the developers for guidance."
 #endif
+
+/* HeFFTe complex type: matches pfft_complex layout (two doubles) but
+   does not require pfft headers.  Used when USE_HEFFTE is defined. */
+#ifdef USE_HEFFTE
+struct my_double_complex
+{
+  double real;
+  double imag;
+};
+#endif /* USE_HEFFTE */
 
 /* vectorialization */
 #define DVEC_SIZE 4
@@ -255,12 +287,25 @@ typedef struct
   ptrdiff_t          GSlocal_k[3];
   ptrdiff_t          GSstart_k[3];
   double             lower_k_cutoff, upper_k_cutoff, norm, BoxSize, CellSize;
+#ifdef USE_HEFFTE
+  heffte_plan        plan;           /* single plan for heffte (handles both directions) */
+#else
   pfft_plan          forward_plan, reverse_plan;
+#endif
   unsigned long long Ntotal;
 } grid_data;
 extern grid_data *MyGrids;
 
+#ifdef USE_HEFFTE
+extern struct my_double_complex **cvector_fft;
+extern long int cvector_size;
+/* HeFFTe box descriptors (set in set_one_grid()) */
+extern int inbox_low[3], inbox_high[3], outbox_low[3], outbox_high[3];
+/* HeFFTe plan options */
+extern heffte_plan_options options_fft;
+#else
 extern pfft_complex **cvector_fft;
+#endif
 extern double **rvector_fft;
 
 #ifdef READ_PK_TABLE

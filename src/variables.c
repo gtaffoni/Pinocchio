@@ -58,7 +58,14 @@ smoothing_data Smoothing;
 grid_data *MyGrids;
 int Ngrids;
 
+#ifdef USE_HEFFTE
+struct my_double_complex **cvector_fft;
+long int cvector_size;
+int inbox_low[3], inbox_high[3], outbox_low[3], outbox_high[3];
+heffte_plan_options options_fft;
+#else
 pfft_complex **cvector_fft;
+#endif
 double **rvector_fft;
 
 param_data params={0};
