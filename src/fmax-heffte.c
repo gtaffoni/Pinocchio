@@ -222,7 +222,7 @@ int set_one_grid(int ThisGrid)
 	//  GRID.total_local_size_fft/2,
 	//  GRID.GSlocal_k[_x_] * GRID.GSlocal_k[_y_] * GRID.GSlocal_k[_z_]);
   
-  dprintf(VDBG, ThisTask, "[set grid %02d] task %d %ld "
+  dprintf(VDBG, ThisTask, "[set grid %02d] task %d %u "
 	  "i: %ld %ld %ld - i start: %ld %ld %ld - "
 	  "o: %ld %ld %ld - o start: %ld %ld %ld\n",
 	  ThisGrid, ThisTask, GRID.total_local_size,

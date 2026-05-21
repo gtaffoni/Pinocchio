@@ -430,7 +430,7 @@ extern subbox_data subbox;
 typedef struct
 {
   double init,total, dens, fft, coll, invcoll, ell, vel, lpt, fmax, distr, sort, group, frag, io,
-    deriv, mem_transf, partial, set_subboxes, set_plc, memory_allocation, fft_initialization
+    deriv, mem_transf, partial, set_subboxes, set_plc, memory_allocation, fft_initialization, fft_compute
 #ifdef PLC
     ,plc
 #endif
