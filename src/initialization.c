@@ -156,20 +156,27 @@ int initialization()
 int initialize_fft(void)
 {
 
+#ifdef USE_HEFFTE
+  /* Initialize heFFTe and its default options */
+  int heffte_err = heffte_set_default_options(BACKEND, &options_fft);
+  if (heffte_err != Heffte_SUCCESS)
+    {
+      printf("Heffte error in default options %d\n", heffte_err);
+      return 1;
+    }
+#else
 #ifdef USE_FFT_THREADS
   //if ( internal.nthreads_fft < 0 )
   internal.nthreads_fft = internal.nthreads_omp;
   if ( internal.nthreads_fft > 1 )
     dprintf(VMSG, 0, "Using %d threads for FFTs\n", internal.nthreads_fft );
+  fftw_init_threads();
 #endif
-  
+
   /* Initialize pfft */
   pfft_init();
 
-  /* Inititalize fftw */
-#ifdef USE_FFT_THREADS
-    fftw_init_threads();
-#endif
+  /* Initialize fftw MPI */
   fftw_mpi_init();
 
   if(set_fft_decomposition())
@@ -184,16 +191,17 @@ int initialize_fft(void)
 	    internal.tasks_subdivision_3D[0] *
 	    internal.tasks_subdivision_3D[1] *
 	    internal.tasks_subdivision_3D[2]);
-  
+
   if ( pfft_create_procmesh(internal.tasks_subdivision_dim, MPI_COMM_WORLD, internal.tasks_subdivision_3D, &FFT_Comm) )
     {
       int all = 1;
       for(int iii = 0; iii < internal.tasks_subdivision_dim; iii++)
   	all *= internal.tasks_subdivision_3D[iii];
-      
+
       pfft_fprintf(MPI_COMM_WORLD, stderr, "Error while creating communicator and mesh with %d processes\n", all);
       return 1;
     }
+#endif /* USE_HEFFTE */
 
   return 0;
 }
@@ -490,7 +498,11 @@ int set_grids()
   MyGrids[0].upper_k_cutoff=NYQUIST * PI;
 
   /* allocates pointers */
+#ifdef USE_HEFFTE
+  cvector_fft=(struct my_double_complex**)malloc(Ngrids * sizeof(struct my_double_complex*));
+#else
   cvector_fft=(pfft_complex**)malloc(Ngrids * sizeof(fftw_complex*));
+#endif
   rvector_fft=(double**)malloc(Ngrids * sizeof(double*));
 
   kdensity=(double**)malloc(Ngrids * sizeof(double*));
