@@ -1,28 +1,79 @@
 /*****************************************************************
- *                        PINOCCHI0  V4.0                        *
+ *                        PINOCCHIO  V5.1                        *
  *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  *
  *****************************************************************
- 
+
  This code was written by
  Pierluigi Monaco
- Copyright (C) 2016
- 
+ Copyright (C) 2016, extended for HeFFTe backend in 2025
+
  web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html
- 
+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation; either version 2 of the License, or
  (at your option) any later version.
- 
+
  This program is distributed in the hope that it will be useful,
  but WITHOUT ANY WARRANTY; without even the implied warranty of
  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  GNU General Public License for more details.
- 
+
  You should have received a copy of the GNU General Public License
  along with this program; if not, write to the Free Software
  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
+
+/**
+ * @file fmax-heffte.c
+ * @brief HeFFTe-based FFT backend for PINOCCHIO collapse time computation
+ *
+ * @details
+ * This module provides multi-backend FFT support via HeFFTe (Highly Efficient FFT library),
+ * which can target FFTW (CPU), CUFFT (NVIDIA GPU), or ROCFFT (AMD GPU) at compile time.
+ * It replaces the PFFT backend used in the default CPU-only build.
+ *
+ * **Algorithm:**
+ *
+ * The PINOCCHIO collapse time calculation (Stage 2 of the pipeline) requires computing
+ * spatial derivatives of the gravitational potential on a 3D grid. This is done via FFT:
+ *
+ * 1. Density field is interpolated onto the grid
+ * 2. Forward FFT (real-to-complex) via heffte_forward()
+ * 3. Multiply in Fourier space by Green's function for each smoothing radius
+ * 4. Inverse FFT (complex-to-real) via heffte_backward()
+ * 5. Extract derivatives on particles via interpolation
+ *
+ * The HeFFTe library handles the pencil-slab MPI decomposition and backend selection
+ * transparently. All operations are wrapped to maintain compatibility with the pfft API.
+ *
+ * **Parallelism:**
+ *
+ * - MPI decomposition: 1D pencil in x-direction (distributed across NTasks)
+ * - OpenMP threading: Optional, via HeFFTe's FFTW backend (-DOMP flag)
+ * - GPU offload: Full offload with GPU_OMP_FULL + heFFTe backend CUFFT
+ * - No explicit GPU kernels: computation delegated to heFFTe library
+ *
+ * **HeFFTe specifics:**
+ *
+ * - Complex number format: struct my_double_complex (real, imag) instead of pfft_complex
+ * - Backend selection at compile time: CUFFT (GPU) or FFTW (CPU)
+ * - No transpose overhead in plan (heFFTe handles redistribution implicitly)
+ *
+ * **References:**
+ *
+ * - HeFFTe documentation: https://icl.utk.edu/fft/
+ * - PINOCCHIO collapse time theory: Monaco et al. 2002, MNRAS 331, 587
+ *
+ * @author Pierluigi Monaco, David Goz, extended for HeFFTe
+ * @date 2025
+ * @version 5.1
+ * @note Requires compilation with -DUSE_HEFFTE and HeFFTe library installed
+ *
+ * @see fmax-pfft.c (CPU-only PFFT alternative)
+ * @see collapse_times.c (calls these FFT functions)
+ * @see fmax.c (host code for collapse time loop)
+ */
 
 #include "pinocchio.h"
 
@@ -75,9 +126,39 @@ int cubes_order(const void *A, const void *B)
 
 
 
+/**
+ * @brief Initialize HeFFTe grid decomposition for a given FFT grid
+ *
+ * @details
+ * Sets up MPI pencil decomposition for the current FFT grid and initializes
+ * HeFFTe-specific box descriptors (inbox_low/high, outbox_low/high).
+ * This is called once per grid before any FFT operations.
+ *
+ * **MPI Decomposition:**
+ *
+ * Decomposes the global grid (GSglobal[x] x GSglobal[y] x GSglobal[z])
+ * into pencils distributed along the x-direction across NTasks MPI ranks.
+ * Each rank gets approximately GSglobal[x]/NTasks slices, with remainder
+ * distributed to the first ranks.
+ *
+ * @param[in] ThisGrid  Index of the FFT grid (0 to Ngrids-1)
+ *
+ * @return 0 on success, non-zero on error
+ *
+ * @warning Must be called before compute_fft_plans() for the same grid.
+ * @warning This function modifies global variables: inbox_low/high, outbox_low/high, cvector_size.
+ *
+ * @note Side effects:
+ * - Sets GRID.GSlocal[3], GRID.GSstart[3], GRID.GSlocal_k[3], GRID.GSstart_k[3]
+ * - Computes cvector_size = GSlocal_k[x] * GSlocal_k[y] * GSlocal_k[z]
+ * - Fills inbox/outbox boxes for HeFFTe
+ *
+ * @see compute_fft_plans()
+ * @see finalize_fft()
+ */
 int set_one_grid(int ThisGrid)
 {
-  
+
   GRID.CellSize = (double)GRID.BoxSize / GRID.GSglobal[_x_];
 
   //int NTasks;
@@ -156,6 +237,34 @@ int set_one_grid(int ThisGrid)
 
 
 
+/**
+ * @brief Create HeFFTe FFT plan for all grids
+ *
+ * @details
+ * Initializes the HeFFTe FFT plan (heffte_plan) for pencil-slab decomposed
+ * 3D complex-to-real and real-to-complex transforms. The plan is created
+ * with options specified in options_fft and uses the backend selected
+ * at compile time (BACKEND macro: CUFFT for GPU, FFTW for CPU).
+ *
+ * This is a collective MPI operation: all ranks must call it with the
+ * same grid configuration.
+ *
+ * @par MPI
+ * Collective call on MPI_COMM_WORLD. All ranks participate.
+ *
+ * @return 0 on success, non-zero on HeFFTe error
+ *
+ * @warning Must be called after set_one_grid() for all grids.
+ * @warning Must be called before forward_transform() or reverse_transform().
+ *
+ * @note The plan is stored in GRID.plan and reused for all smoothing radii.
+ *       No transpose is needed between forward and reverse transforms.
+ *
+ * @see set_one_grid()
+ * @see forward_transform()
+ * @see reverse_transform()
+ * @see finalize_fft()
+ */
 int compute_fft_plans()
 {
   ptrdiff_t DIM[3];
@@ -205,13 +314,39 @@ int compute_fft_plans()
 }
 
 
+/**
+ * @brief Execute forward real-to-complex FFT via HeFFTe
+ *
+ * @details
+ * Performs a real-to-complex fast Fourier transform of the density field
+ * stored in rvector_fft[ThisGrid]. The input array is expected to contain
+ * the density field interpolated to the current grid. Output is written
+ * to cvector_fft[ThisGrid] in Fourier space.
+ *
+ * This is part of the PINOCCHIO collapse time calculation pipeline:
+ * density \f$ \rho(\mathbf{r}) \f$ \f$ \to \f$ FFT \f$ \to \f$ \f$ \hat{\rho}(\mathbf{k}) \f$
+ *
+ * @param[in] ThisGrid  Index of the FFT grid (0 to Ngrids-1)
+ *
+ * @return Time spent in HeFFTe forward transform (in seconds)
+ *
+ * @par MPI
+ * Collective operation within the FFT_Comm communicator. All ranks exchange
+ * data to complete the pencil redistribution.
+ *
+ * @warning The input array rvector_fft[ThisGrid] is destroyed during the transform.
+ * @warning Must be called after set_one_grid() and compute_fft_plans().
+ *
+ * @see reverse_transform()
+ * @see compute_derivative()
+ */
 double forward_transform(int ThisGrid)
 {
   double time;
-  
+
   struct my_double_complex * cvector_fft1 = cvector_fft[ThisGrid];
   double * rvector_fft1 = rvector_fft[ThisGrid];
-  
+
   time=MPI_Wtime();
 
  #ifdef GPU_OMP_FULL
@@ -235,13 +370,37 @@ double forward_transform(int ThisGrid)
 }
 
 
+/**
+ * @brief Execute inverse complex-to-real FFT via HeFFTe
+ *
+ * @details
+ * Performs a complex-to-real inverse Fourier transform of the Fourier-space
+ * data in cvector_fft[ThisGrid] (typically after multiplication by Green's function
+ * in Fourier space). Output is written to rvector_fft[ThisGrid] in real space.
+ *
+ * In the PINOCCHIO collapse time calculation:
+ * \f$ \hat{\phi}(\mathbf{k}) \to \text{IFFT} \to \phi(\mathbf{r}) \f$
+ *
+ * @param[in] ThisGrid  Index of the FFT grid (0 to Ngrids-1)
+ *
+ * @return Time spent in HeFFTe reverse (inverse) transform (in seconds)
+ *
+ * @par MPI
+ * Collective operation within the FFT_Comm communicator.
+ *
+ * @warning The input array cvector_fft[ThisGrid] is destroyed during the transform.
+ * @warning Must be called after set_one_grid() and compute_fft_plans().
+ *
+ * @see forward_transform()
+ * @see compute_derivative()
+ */
 double reverse_transform(int ThisGrid)
 {
   double time;
-  
+
   struct my_double_complex * cvector_fft1 = cvector_fft[ThisGrid];
   double * rvector_fft1 = rvector_fft[ThisGrid];
-    
+
   time=MPI_Wtime();
 
  #ifdef GPU_OMP_FULL
@@ -267,6 +426,22 @@ double reverse_transform(int ThisGrid)
 }
 
 
+/**
+ * @brief Destroy HeFFTe FFT plan and deallocate FFT arrays
+ *
+ * @details
+ * Cleans up all HeFFTe resources and deallocates the FFT working arrays
+ * (cvector_fft, rvector_fft) for all grids. This should be called at the
+ * end of the collapse time computation, before program exit.
+ *
+ * @return 0 on success, 1 on error (failure to deallocate)
+ *
+ * @warning This is a collective operation (each rank destroys its own plan).
+ * @warning After this call, forward_transform() and reverse_transform() cannot be called.
+ *
+ * @see compute_fft_plans()
+ * @see deallocate_fft_vectors()
+ */
 int finalize_fft()
 {
 #ifndef RECOMPUTE_DISPLACEMENTS
@@ -294,6 +469,37 @@ int finalize_fft()
 }
 
 
+/**
+ * @brief Compute spatial derivatives of potential via Fourier-space multiplication
+ *
+ * @details
+ * Multiplies the Fourier-space density field (in cvector_fft[ThisGrid]) by the
+ * Green's function kernel \f$ \frac{1}{k^2} \f$ (and derivatives thereof) to compute
+ * gravitational potential or its spatial derivatives. The process is:
+ *
+ * 1. For each Fourier mode, apply Green's function multiplication
+ * 2. Handle Laplacian: \f$ \nabla^2 \phi = -\rho \f$ by multiplying by \f$ 1/k^2 \f$
+ * 3. Compute derivatives: \f$ \frac{\partial}{\partial x} = -i k_x \hat{\phi}(k) \f$
+ * 4. Inverse FFT to real space
+ * 5. Store results in products (via write_from_rvector())
+ *
+ * @param[in]  ThisGrid            Index of the FFT grid (0 to Ngrids-1)
+ * @param[in]  first_derivative    Which component: 0=x, 1=y, 2=z; or -1 for potential
+ * @param[in]  second_derivative   0 to compute only first_derivative; 1 to compute mixed/second derivatives
+ *
+ * @return 0 on success, non-zero on error
+ *
+ * @par Physics
+ * Implements the Zel'dovich approximation: \f$ \vec{x}(\mathbf{q}, z) = \mathbf{q} - D(z) \nabla \phi(\mathbf{q}) / a(z) \f$
+ * where \f$ \phi \f$ is the Newtonian potential and \f$ D(z) \f$ is the growth factor.
+ *
+ * @warning Must be called between forward_transform() and reverse_transform() for the same grid.
+ * @warning Overwrites cvector_fft[ThisGrid] with derivative data.
+ *
+ * @see forward_transform()
+ * @see reverse_transform()
+ * @see greens_function()
+ */
 int compute_derivative(int ThisGrid, int first_derivative, int second_derivative)
 {
   int    swap, local[3], start[3], C[3], N[3], Nhalf[3];
@@ -301,7 +507,7 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
 #ifdef SCALE_DEPENDENT
   double k_module;
 #endif
-  
+
 #ifdef DEBUG
   sprintf(filename,"results.%d-%d.%d",first_derivative,second_derivative,ThisTask);
   results=fopen(filename,"w");

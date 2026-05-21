@@ -41,6 +41,21 @@
 #include <gsl/gsl_integration.h>
 #include <gsl/gsl_odeiv2.h>
 #include <gsl/gsl_spline.h>
+/**
+ * @brief FFT backend selection: HeFFTe (multi-backend GPU-capable) or pfft (CPU fallback)
+ *
+ * HeFFTe is a portable FFT library supporting multiple backends:
+ * - CUFFT for NVIDIA GPUs (when GPU_OMP_FULL is defined)
+ * - ROCFFT for AMD GPUs
+ * - FFTW for CPU fallback (default)
+ *
+ * Compile with -DUSE_HEFFTE to enable HeFFTe backend. Default build uses pfft.
+ * Both backends expose the same interface (fmax-heffte.c and fmax-pfft.c have
+ * compatible function signatures) to allow seamless switching at compile time.
+ *
+ * @see fmax-heffte.c
+ * @see fmax-pfft.c
+ */
 #ifdef USE_HEFFTE
 /* HeFFTe backend: replaces pfft for multi-backend FFT (CPU FFTW or GPU CUFFT/ROCFFT) */
 #include <heffte.h>
@@ -151,13 +166,23 @@
 #warning "You have correctly compiled the code for the modified gravity scenario. However, please keep in mind that the modified gravity run (MOD_GRAV_FR) is still under development, and this mode should be used with extreme caution as it may not be fully stable. If you are unsure about its usage, please contact the developers for guidance."
 #endif
 
+/**
+ * @brief HeFFTe-native complex number type (no pfft dependency)
+ *
+ * Replaces pfft_complex when USE_HEFFTE is enabled. This structure has the same
+ * memory layout as pfft_complex (two doubles: real and imaginary parts) but does
+ * not require including pfft headers, reducing compile-time dependencies.
+ *
+ * @see my_double_complex.real    Real part of the complex number
+ * @see my_double_complex.imag    Imaginary part of the complex number
+ */
 /* HeFFTe complex type: matches pfft_complex layout (two doubles) but
    does not require pfft headers.  Used when USE_HEFFTE is defined. */
 #ifdef USE_HEFFTE
 struct my_double_complex
 {
-  double real;
-  double imag;
+  double real;    /**< Real component */
+  double imag;    /**< Imaginary component */
 };
 #endif /* USE_HEFFTE */
 
@@ -277,36 +302,77 @@ typedef struct
 extern smoothing_data Smoothing;
 
 extern int Ngrids;
+/**
+ * @brief Grid decomposition and FFT plan metadata
+ *
+ * Describes a 3D FFT grid, its MPI domain decomposition, and FFT execution plan.
+ * Maintains both real-space (GSlocal, GSstart) and Fourier-space (GSlocal_k, GSstart_k)
+ * local grid dimensions to support the pencil decomposition used in heFFTe and pfft.
+ *
+ * @note The FFT plan is backend-dependent: heffte_plan for HeFFTe, pfft_plan for pfft.
+ *       Both backends are initialized via compute_fft_plans() in their respective modules.
+ *
+ * @see compute_fft_plans()
+ * @see fmax-heffte.c
+ * @see fmax-pfft.c
+ */
 typedef struct
 {
-  unsigned int       total_local_size, total_local_size_fft;
-  unsigned int       off, ParticlesPerTask;
-  ptrdiff_t          GSglobal[3];
-  ptrdiff_t          GSlocal[3];
-  ptrdiff_t          GSstart[3];
-  ptrdiff_t          GSlocal_k[3];
-  ptrdiff_t          GSstart_k[3];
-  double             lower_k_cutoff, upper_k_cutoff, norm, BoxSize, CellSize;
+  unsigned int       total_local_size;        /**< Local grid size in real space: GSlocal[x]*GSlocal[y]*GSlocal[z] */
+  unsigned int       total_local_size_fft;    /**< Local FFT buffer size (2 * cvector_size for complex arrays) */
+  unsigned int       off;                     /**< Offset in particle array for this grid */
+  unsigned int       ParticlesPerTask;        /**< Particles assigned to current MPI rank */
+  ptrdiff_t          GSglobal[3];             /**< Global grid size per dimension (must divide evenly by NTasks in x) */
+  ptrdiff_t          GSlocal[3];              /**< Local real-space grid size per dimension */
+  ptrdiff_t          GSstart[3];              /**< Starting index of local real-space grid in global grid */
+  ptrdiff_t          GSlocal_k[3];            /**< Local Fourier-space grid size per dimension */
+  ptrdiff_t          GSstart_k[3];            /**< Starting index of local Fourier-space grid in global grid */
+  double             lower_k_cutoff;          /**< Minimum Fourier mode to compute (smoothing radius dependent) */
+  double             upper_k_cutoff;          /**< Maximum Fourier mode to compute */
+  double             norm;                    /**< FFT normalization factor */
+  double             BoxSize;                 /**< Simulation box size in Mpc/h */
+  double             CellSize;                /**< Grid cell size = BoxSize / GSglobal[x], units of Mpc/h */
 #ifdef USE_HEFFTE
-  heffte_plan        plan;           /* single plan for heffte (handles both directions) */
+  heffte_plan        plan;                    /**< HeFFTe FFT plan (single bidirectional plan) */
 #else
-  pfft_plan          forward_plan, reverse_plan;
+  pfft_plan          forward_plan;            /**< PFFT forward FFT plan (r2c) */
+  pfft_plan          reverse_plan;            /**< PFFT inverse FFT plan (c2r) */
 #endif
-  unsigned long long Ntotal;
+  unsigned long long Ntotal;                  /**< Total number of particles in full simulation */
 } grid_data;
 extern grid_data *MyGrids;
 
+/**
+ * @brief FFT complex array and HeFFTe configuration (backend-dependent)
+ *
+ * When USE_HEFFTE is defined:
+ * - cvector_fft is a 2D array of struct my_double_complex (no pfft headers)
+ * - cvector_size is the Fourier-space array size per MPI rank
+ * - inbox/outbox_low/high are pencil-slab boundaries for HeFFTe FFT decomposition
+ * - options_fft are HeFFTe plan creation flags
+ *
+ * When USE_HEFFTE is not defined:
+ * - cvector_fft is a 2D array of pfft_complex (requires pfft library)
+ *
+ * @note These arrays are allocated in allocate() and deallocated in deallocate_memory().
+ *       They are large: total size ~ 2 * cvector_size * sizeof(double) bytes per rank.
+ *
+ * @see allocate()
+ * @see deallocate_memory()
+ * @see set_one_grid()
+ */
 #ifdef USE_HEFFTE
-extern struct my_double_complex **cvector_fft;
-extern long int cvector_size;
+extern struct my_double_complex **cvector_fft;  /**< Fourier-space complex array (HeFFTe backend) */
+extern long int cvector_size;                   /**< Number of complex elements per rank in Fourier space */
 /* HeFFTe box descriptors (set in set_one_grid()) */
-extern int inbox_low[3], inbox_high[3], outbox_low[3], outbox_high[3];
+extern int inbox_low[3], inbox_high[3];         /**< Input pencil boundaries: [x_low, y_low, z_low] and [x_high, y_high, z_high] */
+extern int outbox_low[3], outbox_high[3];       /**< Output pencil boundaries for transposed layout */
 /* HeFFTe plan options */
-extern heffte_plan_options options_fft;
+extern heffte_plan_options options_fft;         /**< HeFFTe plan configuration flags */
 #else
-extern pfft_complex **cvector_fft;
+extern pfft_complex **cvector_fft;              /**< Fourier-space complex array (PFFT backend) */
 #endif
-extern double **rvector_fft;
+extern double **rvector_fft;                    /**< Real-space array (used by both backends) */
 
 #ifdef READ_PK_TABLE
 typedef struct

@@ -37,14 +37,27 @@ EXEC = pinocchio.x
 # -----------------------------------------------------------------------
 # Build toggles (override from command line, e.g. make OMP=YES GPU=YES)
 # -----------------------------------------------------------------------
-
+#
+# DEBUG    : Enable debug symbols and verbose output (YES/NO, default NO)
+# OMP      : Enable OpenMP threading for CPU parallelism (YES/NO, default NO)
+# USE_HEFFTE : Use HeFFTe FFT backend instead of PFFT (YES/NO, default NO)
+#              HeFFTe supports FFTW (CPU), CUFFT (NVIDIA GPU), ROCFFT (AMD GPU)
+# GPU      : Enable OpenMP GPU offload for collapse_times.c (YES/NO, default NO)
+#            Requires: USE_HEFFTE=YES, nvc compiler, NVIDIA GPU
+#            Activates: GPU_OMP flag, OpenMP target offload, partial GPU execution
+# FULL_GPU : Complete GPU computation (GPU_OMP_FULL mode) (YES/NO, default NO)
+#            Requires: USE_HEFFTE=YES, nvc compiler
+#            Activates: GPU_OMP_FULL flag, CUFFT backend, FFT on GPU
+#
+# Examples:
+#   make USE_HEFFTE=YES            # HeFFTe backend on CPU (FFTW)
+#   make USE_HEFFTE=YES GPU=YES    # HeFFTe with GPU offload (partial)
+#   make FULL_GPU=YES              # Full GPU execution
+#
 DEBUG    ?= NO
 OMP      ?= NO
-# USE_HEFFTE: set to YES to use HeFFTe backend instead of pfft
 USE_HEFFTE ?= NO
-# GPU: enable OpenMP GPU offload (requires USE_HEFFTE=YES and nvc compiler)
 GPU      ?= NO
-# FULL_GPU: all FFT on GPU (GPU_OMP_FULL), implies USE_HEFFTE=YES
 FULL_GPU ?= NO
 
 ########## Preprocessor Definitions ##########
@@ -124,8 +137,15 @@ GPU_FLAG  = -gpu=ccnative -target=gpu
 endif
 
 # -----------------------------------------------------------------------
-# HeFFTe preprocessor flag
+# HeFFTe backend flag: enables portable multi-backend FFT (FFTW/CUFFT/ROCFFT)
 # -----------------------------------------------------------------------
+# When USE_HEFFTE=YES:
+#   - Compiles fmax-heffte.c instead of fmax-pfft.c
+#   - Uses HeFFTe library for FFT instead of PFFT
+#   - Requires heffte library installed with chosen backend
+#   - Allows GPU acceleration via CUFFT (with GPU_OMP or FULL_GPU)
+# Default (USE_HEFFTE=NO): uses PFFT + FFTW on CPU only
+#
 
 ifeq ($(USE_HEFFTE), YES)
 OPTIONS += -DUSE_HEFFTE
@@ -134,6 +154,11 @@ endif
 # -----------------------------------------------------------------------
 # OpenMP Configuration
 # -----------------------------------------------------------------------
+# Configures OpenMP flags based on build mode (CPU, GPU, or FULL_GPU):
+#   OMP=YES:              -fopenmp (CPU threading)
+#   GPU=YES or FULL_GPU=YES: -mp=multicore,gpu (NVIDIA HPC SDK for offload)
+# The -mp flag enables both CPU and GPU OpenMP target directives.
+#
 
 ifeq ($(OMP), YES)
 OPTIONS  += -DUSE_FFT_THREADS
@@ -266,10 +291,16 @@ endif
 ########## System-specific Configuration end ##########
 
 # -----------------------------------------------------------------------
-# Aggregate include and library paths.
-# - For the pfft (default CPU) path: use PFFT + FFTW.
-# - For the heffte path: use HEFF + FFTW (still needed for thread init).
+# Aggregate include and library paths: select FFT backend
 # -----------------------------------------------------------------------
+# The FFT backend (pfft vs heffte) is selected by USE_HEFFTE flag:
+#   USE_HEFFTE=NO (default): use PFFT backend (CPU-only)
+#     - includes: PFFT_INCL, FFTW_INCL, MPI_INCL, GSL_INCL
+#     - libraries: PFFT_LIBR, FFTW_LIBR, MPI_LIBR, GSL_LIBR
+#   USE_HEFFTE=YES: use HeFFTe backend (supports FFTW/CUFFT/ROCFFT)
+#     - includes: HEFF_INCL, FFTW_INCL (still needed), MPI_INCL, GSL_INCL
+#     - libraries: HEFF_LIBR, FFTW_LIBR (still needed), MPI_LIBR, GSL_LIBR
+#
 
 ifeq ($(USE_HEFFTE), YES)
 INC = $(HEFF_INCL) $(FFTW_INCL) $(MPI_INCL) $(GSL_INCL)
@@ -288,13 +319,25 @@ COPTS = $(COPTIMIZED)
 endif
 
 # -----------------------------------------------------------------------
-# Source files
-#
-# Default (CPU pfft path): fmax-pfft.o + parallel_sort.o
-# HeFFTe path (USE_HEFFTE=YES): fmax-heffte.o  (no pfft, keep parallel_sort)
-# GPU path: additionally includes collapse_times_GPU.o,
-#           cubic_spline_interpolation.o, cubic_spline_interpolation_full_GPU.o
+# Source files and object file selection
 # -----------------------------------------------------------------------
+# The build system selects object files based on compile flags:
+#
+# OBJECTS_BASE:
+#   Always compiled core PINOCCHIO modules (IC gen, collapse times, fragmentation, output)
+#
+# FFT_OBJ:
+#   Selects FFT backend implementation:
+#   - USE_HEFFTE=NO (default): fmax-pfft.o (PFFT+FFTW, CPU-only)
+#   - USE_HEFFTE=YES: fmax-heffte.o (HeFFTe, multi-backend)
+#
+# GPU_OBJECTS:
+#   GPU-accelerated implementations (compiled only when GPU or FULL_GPU flags set):
+#   - GPU=YES: collapse_times_GPU.o (partial offload) + cubic_spline_interpolation.o
+#   - FULL_GPU=YES: above + cubic_spline_interpolation_full_GPU.o (all-GPU mode)
+#
+# OBJECTS:
+#   Final object file list passed to linker = OBJECTS_BASE + FFT_OBJ + GPU_OBJECTS
 
 # Base objects (always compiled)
 OBJECTS_BASE = fmax.o variables.o initialization.o collapse_times.o GenIC.o \

@@ -58,15 +58,33 @@ smoothing_data Smoothing;
 grid_data *MyGrids;
 int Ngrids;
 
+/**
+ * @brief FFT arrays and HeFFTe configuration (backend-dependent)
+ *
+ * When USE_HEFFTE is enabled:
+ * - cvector_fft: Fourier-space array using struct my_double_complex (no pfft dependency)
+ * - cvector_size: total complex elements in local Fourier-space grid
+ * - inbox_low/high, outbox_low/high: pencil-slab boundaries for MPI redistribution
+ * - options_fft: HeFFTe plan creation options
+ *
+ * When USE_HEFFTE is not enabled:
+ * - cvector_fft: Fourier-space array using pfft_complex
+ *
+ * Both backends use the same rvector_fft for real-space data.
+ *
+ * @see pinocchio.h (declarations)
+ * @see set_one_grid() (initialization in fmax-heffte.c)
+ */
 #ifdef USE_HEFFTE
-struct my_double_complex **cvector_fft;
-long int cvector_size;
-int inbox_low[3], inbox_high[3], outbox_low[3], outbox_high[3];
-heffte_plan_options options_fft;
+struct my_double_complex **cvector_fft;      /**< Fourier-space arrays (HeFFTe backend) */
+long int cvector_size;                       /**< Size of local Fourier-space grid per rank */
+int inbox_low[3], inbox_high[3];             /**< Input pencil boundaries for FFT decomposition */
+int outbox_low[3], outbox_high[3];           /**< Output pencil boundaries after transform */
+heffte_plan_options options_fft;             /**< HeFFTe plan creation options */
 #else
-pfft_complex **cvector_fft;
+pfft_complex **cvector_fft;                  /**< Fourier-space arrays (PFFT backend) */
 #endif
-double **rvector_fft;
+double **rvector_fft;                        /**< Real-space arrays (both backends) */
 
 param_data params={0};
 output_data outputs;
