@@ -380,8 +380,13 @@ int allocate_main_memory()
   /* allocates fft vectors */
   for (igrid=0; igrid<Ngrids; igrid++)
     {
+#ifdef USE_HEFFTE
+      rvector_fft[igrid] = (double*)malloc(MyGrids[igrid].total_local_size * sizeof(double));
+      cvector_fft[igrid] = (struct my_double_complex*)malloc(cvector_size * sizeof(struct my_double_complex));
+#else
       rvector_fft[igrid] = pfft_alloc_real(MyGrids[igrid].total_local_size_fft);
       cvector_fft[igrid] = pfft_alloc_complex(MyGrids[igrid].total_local_size_fft/2);
+#endif
       //printf("Task %d has got alignment for grid %d [ %llu %llu %llu  -  %llu %llu %llu ]\n", 
     //ThisTask, igrid, (unsigned long long int)rvector_fft[igrid] % 256, (unsigned long long int)rvector_fft[igrid] % 128, (unsigned long long int)rvector_fft[igrid] % 64,
     //(unsigned long long int)cvector_fft[igrid] % 256, (unsigned long long int)cvector_fft[igrid] % 128, (unsigned long long int)cvector_fft[igrid] % 64);
@@ -501,8 +506,13 @@ int allocate_main_memory()
 int deallocate_fft_vectors(int ThisGrid)
 {
 
+#ifdef USE_HEFFTE
+  free(cvector_fft[ThisGrid]);
+  free(rvector_fft[ThisGrid]);
+#else
   pfft_free(cvector_fft[ThisGrid]);
   pfft_free(rvector_fft[ThisGrid]);
+#endif
 
   return 0;
 }
