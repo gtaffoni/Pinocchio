@@ -190,6 +190,10 @@ FFTW_INCL   = -I/usr/local/fftw3/include
 PFFT_LIBR   = -L/usr/local/pfft/lib -lpfft
 PFFT_INCL   = -I/usr/local/pfft/include
 
+HEFFTE_DIR  = /usr/local/heffte/
+HEFF_LIBR   = -L$(HEFFTE_DIR)/lib -lheffte
+HEFF_INCL   = -I$(HEFFTE_DIR)/include
+
 MPI_LIBR    =
 MPI_INCL    =
 GSL_LIBR    = -L$(HOME)/lib -lgsl -lgslcblas -lm
