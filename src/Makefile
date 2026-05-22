@@ -185,6 +185,8 @@ ifeq ($(SYSTYPE),"docker")
 CC          =  mpicc
 CDEBUG      = -ggdb3 -Wall $(OMP_FLAG)
 COPTIMIZED  = -O3 -Wno-unused-result $(OMP_FLAG)
+# docker image has libfftw3_omp but not libfftw3_threads
+OMP_FFTW    = -lfftw3_omp
 FFTW_LIBR   = -L/usr/local/fftw3/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
 FFTW_INCL   = -I/usr/local/fftw3/include
 PFFT_LIBR   = -L/usr/local/pfft/lib -lpfft
