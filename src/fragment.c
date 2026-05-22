@@ -531,6 +531,9 @@ void sort_and_organize(void)
 				   subbox.Nstored);
 
   /* inverse permutation needed by the in-place reorder */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
   for (i=0; i<(int)subbox.Nstored; i++)
     indicesY[indices[i]]=i;
 
@@ -552,6 +555,9 @@ void sort_and_organize(void)
     }
 
   memset(sorted_pos, -1, subbox.Npart * sizeof(int));
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
   for (i=0; i<(int)subbox.Nstored; i++)
     sorted_pos[frag_pos[i]] = i;
 
@@ -660,6 +666,12 @@ int count_peaks(int *ngood)
   ngroups_tot=0;     /* number of groups, group 1 is the filament group */
   *ngood=0;          /* number of groups out of the safety boundary */
 
+  int ngood_local=0; /* thread-private accumulator for ngood */
+
+#if defined(_OPENMP) && !defined(DEBUG)
+#pragma omp parallel for private(i,j,k,nn,peak_cond,i1,j1,k1) \
+        reduction(+:ngroups_tot,ngood_local)
+#endif
   for (iz=0; iz<subbox.Nstored; iz++)
     {
       /* position on the local box */
@@ -732,12 +744,14 @@ int count_peaks(int *ngood)
 	  if ( i>=subbox.safe[_x_] && i<subbox.Lgwbl[_x_]-subbox.safe[_x_] &&
 	       j>=subbox.safe[_y_] && j<subbox.Lgwbl[_y_]-subbox.safe[_y_] &&
 	       k>=subbox.safe[_z_] && k<subbox.Lgwbl[_z_]-subbox.safe[_z_])
-	    (*ngood)++;
+	    ngood_local++;
 #ifdef DEBUG
 	  fprintf(fd," %2d %2d %2d   %12.10f\n",i,j,k,frag[iz].Fmax);
 #endif
 	}
     }
+
+  *ngood += ngood_local; /* accumulate thread-private counter */
 
 #ifdef DEBUG
   fclose(fd);
@@ -878,6 +892,9 @@ int shift_all_displacements()
   /* Shifts all Vel to Vel_prev, at all orders */
 
   /* This shifts Vel_prev to Vel in the fft space */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
   for (int i=0; i<MyGrids[0].total_local_size; i++)
     for (int ia=0; ia<3; ia++)
       {
@@ -897,6 +914,9 @@ int recompute_group_velocities()
 {
   /* Recompute average displacements of group velocities */
   int next,npart,i,ia;
+#ifdef _OPENMP
+#pragma omp parallel for private(next,npart,ia) schedule(dynamic)
+#endif
   for (i=FILAMENT+1; i<=ngroups; i++)
     if (groups[i].point > 0)
       {
