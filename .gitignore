@@ -1,4 +1,6 @@
 state/
+agents/
+agent_docs/
 
 # Compiled objects and executables
 *.o
