@@ -30,7 +30,7 @@ WDM_PartMass_in_kev    0.0          % WDM cut following Bode, Ostriker & Turok (
 # control of memory requirements
 BoundaryLayerFactor    3.0          % width of the boundary layer for fragmentation
 MaxMem                 3600         % max available memory to an MPI task in Mbyte
-MaxMemPerParticle      150          % max available memory in bytes per particle
+MaxMemPerParticle      350          % max available memory in bytes per particle
 PredPeakFactor         0.8          % guess for the number of peaks in the subvolume
 
 # output
