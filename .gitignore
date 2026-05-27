@@ -1,1 +1,23 @@
 state/
+
+# Compiled objects and executables
+*.o
+src/*.x
+example/*.x
+
+# IDE / editor
+.vscode/
+src/.vscode/
+.claude/
+src/.claude/
+
+# Temporary / generated
+lista.txt
+src/outlog
+scripts/__pycache__/
+example/old/
+example/out.Tiago
+example/redshifts
+
+# Nested repo copy (artifact from old operations)
+Pinocchio/
