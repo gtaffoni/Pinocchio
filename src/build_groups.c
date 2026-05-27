@@ -1195,6 +1195,9 @@ int build_groups(int Npeaks, double zstop, int first_call)
  build_groups_statistics:
 
   /* Counters */
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+:counters[14])
+#endif
   for (ig1=FILAMENT+1; ig1<=ngroups; ig1++)
     if (groups[ig1].point >= 0 && groups[ig1].good)
       counters[14]++;
@@ -1229,6 +1232,9 @@ int build_groups(int Npeaks, double zstop, int first_call)
   /* Saving group_ID in the frag structure for the snapshot*/
   groups[0].name=0;
   groups[FILAMENT].name=FILAMENT;
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
   for (iz=0; iz<subbox.Nstored; iz++)
     frag[iz].group_ID = groups[group_ID[iz]].name;
 #endif
