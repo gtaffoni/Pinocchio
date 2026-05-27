@@ -589,27 +589,804 @@ int build_groups(int Npeaks, double zstop, int first_call)
 
 #if defined(_OPENMP) && !defined(CLASSIC_FRAGMENTATION)
   /* ============================================================
-     OPENMP PATH: Main group formation loop.
-     
-     NOTE: The fragmentation loop has a strict temporal dependency:
-     particle i can only accrete onto halos containing a Lagrangian
-     neighbor processed at higher Fmax. This prevents simple loop
-     parallelization with OpenMP across the Fmax-sorted array.
-     
-     The serial Fmax-descending loop is preserved here to guarantee
-     IDENTICAL results to the non-OpenMP build.
-     
-     Parallelism is applied only in the statistics phase (below, at
-     build_groups_statistics) and in the 6-neighbor check inner loop
-     where safe.
-     
-     Future work: wavefront parallelism can be applied when a
-     particle's 6 Lagrangian neighbors all have strictly higher Fmax
-     (i.e., have already been assigned a group). The 3D tiling
-     infrastructure (tile_build/tile_free) is available above for
-     that purpose.
+     OPENMP PATH: 8-color 3D checkerboard tiling parallel loop.
+
+     Algorithm:
+       1. Find the epoch range [last_z, to_z_ep] to process this call.
+       2. Build tile infrastructure partitioning particles into tiles of
+          TILE_SIZE grid spacings; assign each tile one of 8 colors via
+          color = (tx%2) | ((ty%2)<<1) | ((tz%2)<<2).
+       3. Process colors 0..7 SEQUENTIALLY.  Within each color pass,
+          all tiles of that color are processed IN PARALLEL via
+          `#pragma omp parallel for schedule(dynamic)`.
+       4. After all 8 color passes, write any pending outputs, handle
+          PLC post-pass (serial), update progress stats, handle pause.
+       5. Jump to build_groups_statistics label.
+
+     Safety guarantee: same-color tiles are separated by >= TILE_SIZE=8
+     grid spacings.  With f_a ~ 0.18 and M_max ~ 10^4, the maximum
+     accretion radius is ~3.95 < 4 = TILE_SIZE/2, so no two particles
+     from different same-color tiles can belong to the same group.
+     Peak conditions are also safe: same-color tile peaks are not
+     Lagrangian neighbors.
+
+     Thread safety:
+       - ngroups increment / Npeaks check: #pragma omp critical(ngroups_alloc)
+       - groups[FILAMENT].Mass incr/decr:  #pragma omp atomic
+       - counters[]: thread-local tl_cnt[], reduced via critical at end
+       - group_ID[], linking_list[]:  each particle writes its own index
+       - groups[my_group] init after critical: thread has sole ownership
+       - accretion(), merge_groups(): safe – same-color tiles share no groups
+
+     Note on small differences vs serial: boundary particles may see
+     neighbors from unprocessed (later-color) tiles as group_ID=0, which
+     may give slightly different accretion decisions than serial.  This
+     is acceptable per the design document.
      ============================================================ */
-  /* Fall through to the serial loop below — results are identical */
+  {
+    /* ---- Determine epoch range for this call ---- */
+    int to_z_ep = nstep - 1;
+    {
+      int tz;
+      for (tz = last_z; tz < nstep; tz++)
+        if (frag[tz].Fmax < zstop + 1.0) { to_z_ep = tz - 1; break; }
+    }
+
+    if (to_z_ep >= last_z)
+      {
+        /* ---- Build tile structure ---- */
+        tile_build(last_z, to_z_ep, TILE_SIZE);
+
+        /* ---- 8-color parallel loop ---- */
+        int tcolor;
+        for (tcolor = 0; tcolor < 8; tcolor++)
+          {
+            int par_error = 0;  /* set to 1 if fatal error inside parallel */
+
+#pragma omp parallel shared(par_error)
+            {
+              /* Thread-local variables (avoid false sharing, all on stack) */
+              int tl_iz, tl_pi, tl_ci;
+              int tl_ibox, tl_jbox, tl_kbox;
+              int tl_skip, tl_peak_cond;
+              int tl_neigrp, tl_nf, tl_accrflag;
+              int tl_neigh[NV];
+              int tl_fil_list[NV][4];
+              int tl_merge_arr[NV][NV];
+              int tl_nmerge, tl_merge_flag;
+              int tl_ig1, tl_ig2, tl_ig3;
+              int tl_i1, tl_j1, tl_k1, tl_nn;
+              double tl_d2, tl_r2, tl_ratio, tl_best_ratio;
+              int tl_accgrp, tl_to_group = -1, tl_large, tl_small, tl_pos, tl_ifil;
+              int tl_my_group;
+              unsigned long long tl_cnt[NCOUNTERS];
+              memset(tl_cnt, 0, sizeof(tl_cnt));
+
+#pragma omp for schedule(dynamic,1)
+              for (tl_ci = 0; tl_ci < color_cnt_g[tcolor]; tl_ci++)
+                {
+                  /* Skip remaining tiles if a fatal error was detected */
+                  if (par_error) continue;
+
+                  int tl_tid = color_list_g[tcolor][tl_ci];
+                  tile_t *tile = &tiles_g[tl_tid];
+
+                  /* Process particles in this tile in Fmax-descending order */
+                  for (tl_pi = 0; tl_pi < tile->n; tl_pi++)
+                    {
+                      tl_iz = tile->particles[tl_pi];
+
+                      /* === PARTICLE SETUP === */
+                      tl_neigrp  = 0;
+                      tl_nf      = 0;
+                      tl_accrflag = 0;
+                      for (tl_nn = 0; tl_nn < NV; tl_nn++) tl_neigh[tl_nn] = 0;
+
+                      INDEX_TO_COORD(frag_pos[tl_iz], tl_ibox, tl_jbox, tl_kbox,
+                                     subbox.Lgwbl);
+
+                      tl_skip = 0;
+                      if (!subbox.pbc[_x_] &&
+                          (tl_ibox == 0 || tl_ibox == subbox.Lgwbl[_x_]-1)) ++tl_skip;
+                      if (!subbox.pbc[_y_] &&
+                          (tl_jbox == 0 || tl_jbox == subbox.Lgwbl[_y_]-1)) ++tl_skip;
+                      if (!subbox.pbc[_z_] &&
+                          (tl_kbox == 0 || tl_kbox == subbox.Lgwbl[_z_]-1)) ++tl_skip;
+
+                      /* particle_name and good_particle are threadprivate */
+                      particle_name =
+                        COORD_TO_INDEX(
+                          (long long)((tl_ibox + subbox.stabl[_x_] +
+                                       MyGrids[0].GSglobal[_x_]) % MyGrids[0].GSglobal[_x_]),
+                          (long long)((tl_jbox + subbox.stabl[_y_] +
+                                       MyGrids[0].GSglobal[_y_]) % MyGrids[0].GSglobal[_y_]),
+                          (long long)((tl_kbox + subbox.stabl[_z_] +
+                                       MyGrids[0].GSglobal[_z_]) % MyGrids[0].GSglobal[_z_]),
+                          MyGrids[0].GSglobal);
+
+                      good_particle =
+                        (tl_ibox >= subbox.safe[_x_] &&
+                         tl_ibox <  subbox.Lgwbl[_x_] - subbox.safe[_x_] &&
+                         tl_jbox >= subbox.safe[_y_] &&
+                         tl_jbox <  subbox.Lgwbl[_y_] - subbox.safe[_y_] &&
+                         tl_kbox >= subbox.safe[_z_] &&
+                         tl_kbox <  subbox.Lgwbl[_z_] - subbox.safe[_z_]);
+
+                      if (!tl_skip)
+                        {
+                          tl_peak_cond = 1;
+
+                          /* === 6-NEIGHBOR LOOP === */
+                          for (tl_nn = 0; tl_nn < NV; tl_nn++)
+                            {
+                              switch (tl_nn)
+                                {
+                                case 0:
+                                  tl_i1 = (subbox.pbc[_x_] && tl_ibox == 0 ?
+                                           subbox.Lgwbl[_x_]-1 : tl_ibox-1);
+                                  tl_j1 = tl_jbox; tl_k1 = tl_kbox;
+                                  break;
+                                case 1:
+                                  tl_i1 = (subbox.pbc[_x_] &&
+                                           tl_ibox == subbox.Lgwbl[_x_]-1 ?
+                                           0 : tl_ibox+1);
+                                  tl_j1 = tl_jbox; tl_k1 = tl_kbox;
+                                  break;
+                                case 2:
+                                  tl_i1 = tl_ibox;
+                                  tl_j1 = (subbox.pbc[_y_] && tl_jbox == 0 ?
+                                           subbox.Lgwbl[_y_]-1 : tl_jbox-1);
+                                  tl_k1 = tl_kbox;
+                                  break;
+                                case 3:
+                                  tl_i1 = tl_ibox;
+                                  tl_j1 = (subbox.pbc[_y_] &&
+                                           tl_jbox == subbox.Lgwbl[_y_]-1 ?
+                                           0 : tl_jbox+1);
+                                  tl_k1 = tl_kbox;
+                                  break;
+                                case 4:
+                                  tl_i1 = tl_ibox; tl_j1 = tl_jbox;
+                                  tl_k1 = (subbox.pbc[_z_] && tl_kbox == 0 ?
+                                           subbox.Lgwbl[_z_]-1 : tl_kbox-1);
+                                  break;
+                                case 5:
+                                  tl_i1 = tl_ibox; tl_j1 = tl_jbox;
+                                  tl_k1 = (subbox.pbc[_z_] &&
+                                           tl_kbox == subbox.Lgwbl[_z_]-1 ?
+                                           0 : tl_kbox+1);
+                                  break;
+                                default:
+                                  tl_i1 = tl_j1 = tl_k1 = 0; /* unreachable */
+                                }
+
+                              /* find_location returns frag-order index, or -1 */
+                              tl_pos = find_location(tl_i1, tl_j1, tl_k1);
+                              if (tl_pos >= 0)
+                                {
+                                  tl_neigh[tl_nn] = group_ID[tl_pos];
+                                  tl_peak_cond &=
+                                    (frag[tl_iz].Fmax > frag[tl_pos].Fmax);
+                                }
+                              else
+                                tl_neigh[tl_nn] = 0;
+
+                              if (tl_neigh[tl_nn] == FILAMENT)
+                                {
+                                  tl_neigh[tl_nn] = 0;
+                                  tl_fil_list[tl_nf][0] = tl_i1;
+                                  tl_fil_list[tl_nf][1] = tl_j1;
+                                  tl_fil_list[tl_nf][2] = tl_k1;
+                                  tl_fil_list[tl_nf][3] = tl_pos;
+                                  tl_nf++;
+                                }
+                            } /* end 6-neighbor loop */
+
+                          /* Remove duplicates from neighbor list */
+                          clean_list(tl_neigh);
+
+                          for (tl_nn = tl_neigrp = 0; tl_nn < NV; tl_nn++)
+                            if (tl_neigh[tl_nn] > FILAMENT) tl_neigrp++;
+
+                          if (tl_neigrp > 0 && good_particle)
+                            tl_cnt[tl_neigrp]++;
+                        }
+                      else
+                        {
+                          tl_peak_cond = 0;
+                          tl_neigrp    = 0;
+                        }
+
+                      /* === CASE 1: PEAK === */
+                      if (tl_peak_cond)
+                        {
+                          if (good_particle) tl_cnt[0]++;
+
+#pragma omp critical(ngroups_alloc)
+                          {
+                            ngroups++;
+                            if (ngroups > Npeaks + 2)
+                              par_error = 1;
+                            tl_my_group = ngroups;
+                          }
+
+                          if (par_error) break;
+
+                          /* Init new group — thread has exclusive ownership
+                             of groups[tl_my_group] after critical section   */
+                          groups[tl_my_group].t_peak   = frag[tl_iz].Fmax;
+                          groups[tl_my_group].t_appear = -1;
+                          groups[tl_my_group].t_merge  = -1;
+                          groups[tl_my_group].Pos[0] = tl_ibox + SHIFT;
+                          groups[tl_my_group].Pos[1] = tl_jbox + SHIFT;
+                          groups[tl_my_group].Pos[2] = tl_kbox + SHIFT;
+                          groups[tl_my_group].Vel[0] = frag[tl_iz].Vel[0];
+                          groups[tl_my_group].Vel[1] = frag[tl_iz].Vel[1];
+                          groups[tl_my_group].Vel[2] = frag[tl_iz].Vel[2];
+#ifdef TWO_LPT
+                          groups[tl_my_group].Vel_2LPT[0] = frag[tl_iz].Vel_2LPT[0];
+                          groups[tl_my_group].Vel_2LPT[1] = frag[tl_iz].Vel_2LPT[1];
+                          groups[tl_my_group].Vel_2LPT[2] = frag[tl_iz].Vel_2LPT[2];
+#ifdef THREE_LPT
+                          groups[tl_my_group].Vel_3LPT_1[0] = frag[tl_iz].Vel_3LPT_1[0];
+                          groups[tl_my_group].Vel_3LPT_1[1] = frag[tl_iz].Vel_3LPT_1[1];
+                          groups[tl_my_group].Vel_3LPT_1[2] = frag[tl_iz].Vel_3LPT_1[2];
+                          groups[tl_my_group].Vel_3LPT_2[0] = frag[tl_iz].Vel_3LPT_2[0];
+                          groups[tl_my_group].Vel_3LPT_2[1] = frag[tl_iz].Vel_3LPT_2[1];
+                          groups[tl_my_group].Vel_3LPT_2[2] = frag[tl_iz].Vel_3LPT_2[2];
+#endif
+#endif
+#ifdef RECOMPUTE_DISPLACEMENTS
+                          groups[tl_my_group].Vel_prev[0] = frag[tl_iz].Vel_prev[0];
+                          groups[tl_my_group].Vel_prev[1] = frag[tl_iz].Vel_prev[1];
+                          groups[tl_my_group].Vel_prev[2] = frag[tl_iz].Vel_prev[2];
+#ifdef TWO_LPT
+                          groups[tl_my_group].Vel_2LPT_prev[0] = frag[tl_iz].Vel_2LPT_prev[0];
+                          groups[tl_my_group].Vel_2LPT_prev[1] = frag[tl_iz].Vel_2LPT_prev[1];
+                          groups[tl_my_group].Vel_2LPT_prev[2] = frag[tl_iz].Vel_2LPT_prev[2];
+#ifdef THREE_LPT
+                          groups[tl_my_group].Vel_3LPT_1_prev[0] = frag[tl_iz].Vel_3LPT_1_prev[0];
+                          groups[tl_my_group].Vel_3LPT_1_prev[1] = frag[tl_iz].Vel_3LPT_1_prev[1];
+                          groups[tl_my_group].Vel_3LPT_1_prev[2] = frag[tl_iz].Vel_3LPT_1_prev[2];
+                          groups[tl_my_group].Vel_3LPT_2_prev[0] = frag[tl_iz].Vel_3LPT_2_prev[0];
+                          groups[tl_my_group].Vel_3LPT_2_prev[1] = frag[tl_iz].Vel_3LPT_2_prev[1];
+                          groups[tl_my_group].Vel_3LPT_2_prev[2] = frag[tl_iz].Vel_3LPT_2_prev[2];
+#endif
+#endif
+#endif
+                          groups[tl_my_group].Mass     = 1;
+                          groups[tl_my_group].name     = particle_name;
+                          groups[tl_my_group].good     = good_particle;
+                          groups[tl_my_group].point    = tl_iz;
+                          groups[tl_my_group].bottom   = tl_iz;
+                          groups[tl_my_group].ll       = tl_my_group;
+                          groups[tl_my_group].halo_app = tl_my_group;
+#ifdef PLC
+                          if (frag[tl_iz].Fmax > plc.Fstart)
+                            groups[tl_my_group].Flast = plc.Fstart;
+                          else
+                            groups[tl_my_group].Flast = frag[tl_iz].Fmax;
+#endif
+                          group_ID[tl_iz]     = tl_my_group;
+                          linking_list[tl_iz] = tl_iz;
+
+                          if (params.MinHaloMass == 1)
+                            {
+                              groups[tl_my_group].t_appear = frag[tl_iz].Fmax;
+#ifdef SNAPSHOT
+                              frag[tl_iz].zacc = frag[tl_iz].Fmax - 1;
+#endif
+                            }
+                        }
+
+                      /* === CASE 2: SINGLE NEIGHBOUR GROUP === */
+                      else if (tl_neigrp == 1)
+                        {
+                          condition_for_accretion(1, tl_ibox, tl_jbox, tl_kbox,
+                                                  tl_iz, frag[tl_iz].Fmax,
+                                                  tl_neigh[0], &tl_d2, &tl_r2);
+                          if (tl_d2 < tl_r2)
+                            {
+                              if (good_particle) tl_cnt[7]++;
+                              tl_accrflag  = 1;
+                              tl_to_group  = tl_neigh[0];
+                              accretion(tl_to_group, tl_ibox, tl_jbox, tl_kbox,
+                                        tl_iz, frag[tl_iz].Fmax);
+                            }
+                          else
+                            {
+                              if (good_particle) tl_cnt[12]++;
+#pragma omp atomic
+                              groups[FILAMENT].Mass++;
+                              group_ID[tl_iz]     = FILAMENT;
+                              linking_list[tl_iz] = tl_iz;
+                            }
+                        }
+
+                      /* === CASE 3: MULTIPLE NEIGHBOUR GROUPS === */
+                      else if (tl_neigrp > 1)
+                        {
+                          /* Try to accrete onto closest group */
+                          tl_best_ratio = pow(10.0 * subbox.Lgwbl[_x_], 2.0);
+                          tl_accgrp = -1;
+                          for (tl_ig1 = 0; tl_ig1 < tl_neigrp; tl_ig1++)
+                            {
+                              condition_for_accretion(2, tl_ibox, tl_jbox, tl_kbox,
+                                                      tl_iz, frag[tl_iz].Fmax,
+                                                      tl_neigh[tl_ig1],
+                                                      &tl_d2, &tl_r2);
+                              tl_ratio = tl_d2 / tl_r2;
+                              if (tl_ratio < 1.0 && tl_ratio < tl_best_ratio)
+                                {
+                                  tl_best_ratio = tl_ratio;
+                                  tl_accgrp     = tl_ig1;
+                                }
+                            }
+
+                          if (tl_accgrp >= 0)
+                            {
+                              if (good_particle)
+                                {
+                                  tl_cnt[7]++;
+                                  tl_cnt[8]++;
+                                }
+                              tl_accrflag = 1;
+                              tl_to_group = tl_neigh[tl_accgrp];
+                              accretion(tl_neigh[tl_accgrp],
+                                        tl_ibox, tl_jbox, tl_kbox,
+                                        tl_iz, frag[tl_iz].Fmax);
+                            }
+
+                          /* Check pairwise merging */
+                          tl_nmerge = 0;
+                          for (tl_ig1 = 0; tl_ig1 < tl_neigrp; tl_ig1++)
+                            for (tl_ig2 = 0; tl_ig2 < tl_ig1; tl_ig2++)
+                              {
+                                tl_merge_arr[tl_ig1][tl_ig2] = 0;
+                                condition_for_merging(frag[tl_iz].Fmax,
+                                                      tl_neigh[tl_ig1],
+                                                      tl_neigh[tl_ig2],
+                                                      &tl_merge_flag);
+                                if (tl_merge_flag)
+                                  {
+                                    tl_merge_arr[tl_ig1][tl_ig2] = 1;
+                                    tl_nmerge++;
+                                  }
+                              }
+
+                          if (tl_nmerge > 0)
+                            {
+                              for (tl_ig1 = 0; tl_ig1 < tl_neigrp; tl_ig1++)
+                                for (tl_ig2 = 0; tl_ig2 < tl_ig1; tl_ig2++)
+                                  if (tl_merge_arr[tl_ig1][tl_ig2] == 1 &&
+                                      tl_neigh[tl_ig1] != tl_neigh[tl_ig2])
+                                    {
+                                      if (good_particle) tl_cnt[10]++;
+                                      if (groups[tl_neigh[tl_ig1]].Mass >
+                                          groups[tl_neigh[tl_ig2]].Mass)
+                                        {
+                                          merge_groups(tl_neigh[tl_ig1],
+                                                       tl_neigh[tl_ig2],
+                                                       frag[tl_iz].Fmax);
+                                          tl_large = tl_neigh[tl_ig1];
+                                          tl_small = tl_neigh[tl_ig2];
+                                        }
+                                      else
+                                        {
+                                          merge_groups(tl_neigh[tl_ig2],
+                                                       tl_neigh[tl_ig1],
+                                                       frag[tl_iz].Fmax);
+                                          tl_small = tl_neigh[tl_ig1];
+                                          tl_large = tl_neigh[tl_ig2];
+                                        }
+                                      if (tl_to_group == tl_small)
+                                        tl_to_group = tl_large;
+                                      for (tl_ig3 = 0; tl_ig3 < tl_neigrp; tl_ig3++)
+                                        if (tl_neigh[tl_ig3] == tl_small)
+                                          tl_neigh[tl_ig3] = tl_large;
+                                      if (groups[tl_large].Mass <
+                                          5 * groups[tl_small].Mass && good_particle)
+                                        tl_cnt[11]++;
+                                    }
+                            }
+
+                          /* Retry accretion if not yet accreted */
+                          if (tl_accgrp == -1)
+                            {
+                              clean_list(tl_neigh);
+                              for (tl_nn = tl_neigrp = 0; tl_nn < NV; tl_nn++)
+                                if (tl_neigh[tl_nn] > FILAMENT) tl_neigrp++;
+
+                              tl_best_ratio = pow(10.0 * subbox.Lgwbl[_x_], 2.0);
+                              tl_accgrp = -1;
+                              for (tl_ig1 = 0; tl_ig1 < tl_neigrp; tl_ig1++)
+                                {
+                                  condition_for_accretion(3, tl_ibox, tl_jbox,
+                                                          tl_kbox, tl_iz,
+                                                          frag[tl_iz].Fmax,
+                                                          tl_neigh[tl_ig1],
+                                                          &tl_d2, &tl_r2);
+                                  tl_ratio = tl_d2 / tl_r2;
+                                  if (tl_ratio < tl_best_ratio)
+                                    {
+                                      tl_best_ratio = tl_ratio;
+                                      tl_accgrp     = tl_ig1;
+                                    }
+                                }
+
+                              if (tl_best_ratio < 1.0)
+                                {
+                                  if (good_particle)
+                                    {
+                                      tl_cnt[7]++;
+                                      tl_cnt[9]++;
+                                    }
+                                  tl_accrflag = 1;
+                                  tl_to_group = tl_neigh[tl_accgrp];
+                                  accretion(tl_neigh[tl_accgrp],
+                                            tl_ibox, tl_jbox, tl_kbox,
+                                            tl_iz, frag[tl_iz].Fmax);
+                                }
+                              else
+                                {
+                                  if (good_particle) tl_cnt[12]++;
+#pragma omp atomic
+                                  groups[FILAMENT].Mass++;
+                                  group_ID[tl_iz]     = FILAMENT;
+                                  linking_list[tl_iz] = tl_iz;
+                                }
+                            }
+                        }
+
+                      /* === CASE 4: FILAMENT === */
+                      else
+                        {
+                          if (good_particle) tl_cnt[12]++;
+#pragma omp atomic
+                          groups[FILAMENT].Mass++;
+                          group_ID[tl_iz]     = FILAMENT;
+                          linking_list[tl_iz] = tl_iz;
+                        }
+
+                      /* === FILAMENT ACCRETION POST-CHECK === */
+                      if (tl_accrflag && tl_nf && !tl_skip)
+                        {
+                          /* First pass: tag filaments that qualify */
+                          for (tl_ifil = 0; tl_ifil < tl_nf; tl_ifil++)
+                            {
+                              condition_for_accretion(4,
+                                tl_fil_list[tl_ifil][0],
+                                tl_fil_list[tl_ifil][1],
+                                tl_fil_list[tl_ifil][2],
+                                tl_fil_list[tl_ifil][3],
+                                frag[tl_iz].Fmax, tl_to_group,
+                                &tl_d2, &tl_r2);
+                              if (tl_d2 < tl_r2)
+                                tl_fil_list[tl_ifil][3] *= -1; /* tag */
+                            }
+                          /* Second pass: accrete tagged filaments */
+                          for (tl_ifil = 0; tl_ifil < tl_nf; tl_ifil++)
+                            if (tl_fil_list[tl_ifil][3] < 0)
+                              {
+                                tl_fil_list[tl_ifil][3] *= -1; /* untag */
+                                accretion(tl_to_group,
+                                          tl_fil_list[tl_ifil][0],
+                                          tl_fil_list[tl_ifil][1],
+                                          tl_fil_list[tl_ifil][2],
+                                          tl_fil_list[tl_ifil][3],
+                                          frag[tl_iz].Fmax);
+#pragma omp atomic
+                                groups[FILAMENT].Mass--;
+
+                                if (tl_fil_list[tl_ifil][0] >= subbox.safe[_x_] &&
+                                    tl_fil_list[tl_ifil][0] <
+                                      subbox.Lgwbl[_x_] - subbox.safe[_x_] &&
+                                    tl_fil_list[tl_ifil][1] >= subbox.safe[_y_] &&
+                                    tl_fil_list[tl_ifil][1] <
+                                      subbox.Lgwbl[_y_] - subbox.safe[_y_] &&
+                                    tl_fil_list[tl_ifil][2] >= subbox.safe[_z_] &&
+                                    tl_fil_list[tl_ifil][2] <
+                                      subbox.Lgwbl[_z_] - subbox.safe[_z_])
+                                  {
+                                    tl_cnt[7]++;
+                                    tl_cnt[13]++;
+                                    tl_cnt[12]--;
+                                  }
+                              }
+                        } /* end filament accretion */
+
+                    } /* end particle loop within tile */
+                } /* end omp for over tiles */
+
+              /* Reduce thread-local counters into global after each color pass */
+#pragma omp critical(counters_reduce)
+              {
+                int tl_ci2;
+                for (tl_ci2 = 0; tl_ci2 < NCOUNTERS; tl_ci2++)
+                  counters[tl_ci2] += tl_cnt[tl_ci2];
+              }
+            } /* end omp parallel */
+
+            if (par_error)
+              {
+                printf("OH MY DEAR, TASK %d FOUND TOO MANY GROUPS, THIS SHOULD NOT HAPPEN!\n",
+                       ThisTask);
+                tile_free();
+                return 1;
+              }
+
+          } /* end color loop (0..7) */
+
+        /* ---- PLC post-pass: serial, using correct group_ID[] from tiling ---- */
+#ifdef PLC
+        {
+          /* Re-run PLC logic serially over all particles in the epoch.
+             group_ID[] is now fully populated so PLC checks are exact.  */
+          int tl_tz;
+          for (tl_tz = last_z; tl_tz <= to_z_ep; tl_tz++)
+            {
+              int tl_iz2 = tl_tz;
+              int tl_ibox2, tl_jbox2, tl_kbox2;
+              INDEX_TO_COORD(frag_pos[tl_iz2], tl_ibox2, tl_jbox2, tl_kbox2,
+                             subbox.Lgwbl);
+
+              int tl_skip2 = 0;
+              if (!subbox.pbc[_x_] &&
+                  (tl_ibox2 == 0 || tl_ibox2 == subbox.Lgwbl[_x_]-1)) ++tl_skip2;
+              if (!subbox.pbc[_y_] &&
+                  (tl_jbox2 == 0 || tl_jbox2 == subbox.Lgwbl[_y_]-1)) ++tl_skip2;
+              if (!subbox.pbc[_z_] &&
+                  (tl_kbox2 == 0 || tl_kbox2 == subbox.Lgwbl[_z_]-1)) ++tl_skip2;
+
+              if (tl_skip2) continue;
+
+              /* Rebuild neighbor list to get neigrp and neigh[] */
+              int tl_neigh2[NV];
+              int tl_neigrp2 = 0;
+              int tl_nn2;
+              for (tl_nn2 = 0; tl_nn2 < NV; tl_nn2++) tl_neigh2[tl_nn2] = 0;
+
+              int tl_i1p, tl_j1p, tl_k1p;
+              for (tl_nn2 = 0; tl_nn2 < NV; tl_nn2++)
+                {
+                  switch (tl_nn2)
+                    {
+                    case 0:
+                      tl_i1p = (subbox.pbc[_x_] && tl_ibox2 == 0 ?
+                                subbox.Lgwbl[_x_]-1 : tl_ibox2-1);
+                      tl_j1p = tl_jbox2; tl_k1p = tl_kbox2; break;
+                    case 1:
+                      tl_i1p = (subbox.pbc[_x_] &&
+                                tl_ibox2 == subbox.Lgwbl[_x_]-1 ?
+                                0 : tl_ibox2+1);
+                      tl_j1p = tl_jbox2; tl_k1p = tl_kbox2; break;
+                    case 2:
+                      tl_i1p = tl_ibox2;
+                      tl_j1p = (subbox.pbc[_y_] && tl_jbox2 == 0 ?
+                                subbox.Lgwbl[_y_]-1 : tl_jbox2-1);
+                      tl_k1p = tl_kbox2; break;
+                    case 3:
+                      tl_i1p = tl_ibox2;
+                      tl_j1p = (subbox.pbc[_y_] &&
+                                tl_jbox2 == subbox.Lgwbl[_y_]-1 ?
+                                0 : tl_jbox2+1);
+                      tl_k1p = tl_kbox2; break;
+                    case 4:
+                      tl_i1p = tl_ibox2; tl_j1p = tl_jbox2;
+                      tl_k1p = (subbox.pbc[_z_] && tl_kbox2 == 0 ?
+                                subbox.Lgwbl[_z_]-1 : tl_kbox2-1); break;
+                    case 5:
+                      tl_i1p = tl_ibox2; tl_j1p = tl_jbox2;
+                      tl_k1p = (subbox.pbc[_z_] &&
+                                tl_kbox2 == subbox.Lgwbl[_z_]-1 ?
+                                0 : tl_kbox2+1); break;
+                    default:
+                      tl_i1p = tl_j1p = tl_k1p = 0;
+                    }
+                  int tl_pos2 = find_location(tl_i1p, tl_j1p, tl_k1p);
+                  if (tl_pos2 >= 0 && group_ID[tl_pos2] > FILAMENT)
+                    tl_neigh2[tl_nn2] = group_ID[tl_pos2];
+                }
+              clean_list(tl_neigh2);
+              for (tl_nn2 = 0; tl_nn2 < NV; tl_nn2++)
+                if (tl_neigh2[tl_nn2] > FILAMENT) tl_neigrp2++;
+
+              /* Periodic PLC sync check */
+              if (plc_started &&
+                  frag[tl_iz2].Fmax < NextF_PLC &&
+                  frag[tl_iz2].Fmax >= plc.Fstop)
+                {
+                  int mysave2, save2;
+                  mysave2 = (plc.Nmax - plc.Nstored <
+                             SAFEPLC * (plc.Nstored - plc.Nstored_last));
+                  MPI_Reduce(&mysave2, &save2, 1, MPI_INT, MPI_SUM, 0,
+                             MPI_COMM_WORLD);
+                  MPI_Bcast(&save2, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                  if (save2)
+                    {
+                      if (write_PLC(0)) { tile_free(); return 1; }
+                      plc.Nstored = 0;
+                    }
+                  NextF_PLC *= DeltaF_PLC;
+                  plc.Nstored_last = plc.Nstored;
+                }
+
+              /* PLC crossing check for each neighbouring group */
+              if (frag[tl_iz2].Fmax < plc.Fstart &&
+                  frag[tl_iz2].Fmax >= plc.Fstop)
+                {
+                  if (!plc_started)
+                    {
+                      plc_started = 1;
+                      if (!ThisTask)
+                        printf("[%s] Starting PLC reconstruction\n", fdate());
+                      cputmp = MPI_Wtime();
+                    }
+                  int tl_storex = subbox.pbc[_x_];
+                  int tl_storey = subbox.pbc[_y_];
+                  int tl_storez = subbox.pbc[_z_];
+                  subbox.pbc[_x_] = subbox.pbc[_y_] = subbox.pbc[_z_] = 0;
+
+                  int tl_ig1p;
+                  for (tl_ig1p = 0; tl_ig1p < tl_neigrp2; tl_ig1p++)
+                    {
+                      if (tl_neigh2[tl_ig1p] > FILAMENT &&
+                          groups[tl_neigh2[tl_ig1p]].good &&
+                          groups[tl_neigh2[tl_ig1p]].Mass >= params.MinHaloMass)
+                        {
+                          int tl_irep;
+                          thisgroup = tl_neigh2[tl_ig1p];
+                          for (tl_irep = 0; tl_irep < plc.Nreplications; tl_irep++)
+                            if (!(frag[tl_iz2].Fmax > plc.repls[tl_irep].F1 ||
+                                  groups[thisgroup].Flast < plc.repls[tl_irep].F2))
+                              {
+                                double tl_aa, tl_bb, tl_Fplc;
+                                replicate[0] = plc.repls[tl_irep].i;
+                                replicate[1] = plc.repls[tl_irep].j;
+                                replicate[2] = plc.repls[tl_irep].k;
+                                tl_bb = condition_PLC(frag[tl_iz2].Fmax);
+                                if (tl_bb == 0.0)
+                                  {
+                                    if (store_PLC(frag[tl_iz2].Fmax))
+                                      { tile_free(); return 1; }
+                                  }
+                                else if (tl_bb > 0.0)
+                                  {
+                                    tl_aa = condition_PLC(groups[thisgroup].Flast);
+                                    if (tl_aa < 0.0)
+                                      {
+                                        tl_Fplc = find_brent(groups[thisgroup].Flast,
+                                                             frag[tl_iz2].Fmax);
+                                        if (tl_Fplc == -99.0)
+                                          { tile_free(); return 1; }
+                                        if (store_PLC(tl_Fplc))
+                                          { tile_free(); return 1; }
+                                      }
+                                  }
+                              }
+                          groups[tl_neigh2[tl_ig1p]].Flast = frag[tl_iz2].Fmax;
+                        }
+                    }
+                  subbox.pbc[_x_] = tl_storex;
+                  subbox.pbc[_y_] = tl_storey;
+                  subbox.pbc[_z_] = tl_storez;
+                }
+              else if (plc.Fstart > 0.0 && frag[tl_iz2].Fmax < plc.Fstart)
+                {
+                  int tl_ig1p;
+                  for (tl_ig1p = 0; tl_ig1p < tl_neigrp2; tl_ig1p++)
+                    if (tl_neigh2[tl_ig1p] > FILAMENT)
+                      groups[tl_neigh2[tl_ig1p]].Flast = frag[tl_iz2].Fmax;
+                }
+
+              /* PLC final check at end of epoch or stop condition */
+              if (plc.Fstart > 0 && !last_check_done &&
+                  (tl_tz == to_z_ep || frag[tl_iz2].Fmax < plc.Fstop))
+                {
+                  if (write_PLC(0)) { tile_free(); return 1; }
+                  plc.Nstored = 0;
+                  int tl_storex = subbox.pbc[_x_];
+                  int tl_storey = subbox.pbc[_y_];
+                  int tl_storez = subbox.pbc[_z_];
+                  subbox.pbc[_x_] = subbox.pbc[_y_] = subbox.pbc[_z_] = 0;
+                  last_check_done = 1;
+                  int tl_g;
+                  for (tl_g = FILAMENT+1; tl_g <= ngroups; tl_g++)
+                    {
+                      if (groups[tl_g].point >= 0 && groups[tl_g].good &&
+                          groups[tl_g].Mass >= params.MinHaloMass)
+                        {
+                          int tl_irep;
+                          thisgroup = tl_g;
+                          for (tl_irep = 0; tl_irep < plc.Nreplications; tl_irep++)
+                            if (groups[tl_g].Flast > plc.repls[tl_irep].F2)
+                              {
+                                double tl_aa, tl_bb, tl_Fplc;
+                                replicate[0] = plc.repls[tl_irep].i;
+                                replicate[1] = plc.repls[tl_irep].j;
+                                replicate[2] = plc.repls[tl_irep].k;
+                                tl_bb = condition_PLC(plc.Fstop);
+                                if (tl_bb == 0.0)
+                                  {
+                                    if (store_PLC(plc.Fstop))
+                                      { tile_free(); return 1; }
+                                  }
+                                else if (tl_bb > 0.0)
+                                  {
+                                    tl_aa = condition_PLC(groups[tl_g].Flast);
+                                    if (tl_aa < 0.0)
+                                      {
+                                        tl_Fplc = find_brent(groups[tl_g].Flast,
+                                                             plc.Fstop);
+                                        if (tl_Fplc == -99.0)
+                                          { tile_free(); return 1; }
+                                        if (store_PLC(tl_Fplc))
+                                          { tile_free(); return 1; }
+                                      }
+                                  }
+                              }
+                        }
+                    }
+                  subbox.pbc[_x_] = tl_storex;
+                  subbox.pbc[_y_] = tl_storey;
+                  subbox.pbc[_z_] = tl_storez;
+                  if (!ThisTask)
+                    printf("[%s] PLC: Last check done, Task 0 stored %d halos (max:%d)\n",
+                           fdate(), plc.Nstored, plc.Nmax);
+                  cputime.plc += MPI_Wtime() - cputmp;
+                  if (write_PLC(1)) { tile_free(); return 1; }
+                  break; /* stop PLC post-pass early */
+                }
+            } /* end PLC post-pass loop */
+        }
+#endif /* PLC */
+
+        /* ---- Progress print ---- */
+        if (!ThisTask)
+          printf("[%s] *** %3d%% done via tiling, F = %6.2f,  z = %6.2f\n",
+                 fdate(), 100, frag[to_z_ep].Fmax, frag[to_z_ep].Fmax - 1.0);
+
+        /* ---- Write pending outputs (serial, after all tiling) ---- */
+        {
+          double tl_cputmp;
+          int tl_this_last = (to_z_ep == nstep - 1) ? 1 : 0;
+          while (iout < outputs.n &&
+                 (tl_this_last || frag[to_z_ep].Fmax < outputs.F[iout]))
+            {
+              tl_cputmp = MPI_Wtime();
+              if (!ThisTask)
+                printf("[%s] Writing output at z=%f\n", fdate(),
+                       outputs.z[iout]);
+              fflush(stdout);
+              MPI_Barrier(MPI_COMM_WORLD);
+              if (write_catalog(iout))   { tile_free(); return 1; }
+              if (compute_mf(iout))      { tile_free(); return 1; }
+              if (iout == outputs.n - 1)
+                {
+                  if (write_histories()) { tile_free(); return 1; }
+                }
+              cputime.io += MPI_Wtime() - tl_cputmp;
+              iout++;
+              if (tl_this_last) break;
+            }
+        }
+
+        tile_free();
+
+        /* ---- Handle pause / completion ---- */
+        if (to_z_ep < nstep - 1)
+          {
+            if (!ThisTask)
+              printf("[%s] Pausing fragmentation process\n", fdate());
+            last_z = to_z_ep + 1;
+            return 0;
+          }
+        last_z = nstep; /* mark done */
+
+      } /* end if (to_z_ep >= last_z) */
+
+    goto build_groups_statistics;
+  }
 #endif /* defined(_OPENMP) && !defined(CLASSIC_FRAGMENTATION) */
 
 
