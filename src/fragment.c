@@ -405,16 +405,6 @@ int fragment()
 	{
 	  /* full fragmentation is done segmenting the redshift interval */
 
-	  /* Initialize GFLUT tables for thread-safe growth factor lookups.
-	     The range covers z=0 to the maximum Fmax in the particle list. */
-	  {
-	    double gflut_zmin = 0.0;
-	    double gflut_zmax = (double)frag[0].Fmax - 1.0;
-	    if (gflut_zmax < 1.0) gflut_zmax = 1.0;  /* safety floor */
-	    gflut_init(gflut_zmin, gflut_zmax);
-	    gflut_validate();
-	  }
-
 	  for (int mysegment=0; mysegment<ScaleDep.nseg; mysegment++)
 	    {
 	      ScaleDep.myseg=mysegment;
@@ -453,17 +443,10 @@ int fragment()
 		}
 #endif
 
-	      /* Pre-compute Eulerian positions and sigmaD for OpenMP parallel path */
-	      precomp_allocate(subbox.Nstored);
-	      precompute_particles();
-
 	      tmp=MPI_Wtime();
 
 	      if (build_groups(Npeaks,ScaleDep.z[mysegment],(mysegment==0)))
 		return 1;
-
-	      /* Free pre-computed data after each segment */
-	      precomp_free();
 
 	      tmp=MPI_Wtime()-tmp;
 	      if (!ThisTask)
