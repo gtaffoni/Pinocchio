@@ -50,7 +50,154 @@ unsigned long long int particle_name;
 int good_particle;
 pos_data obj1,obj2;
 
+/* Make per-particle globals thread-private so that accretion(),
+   merge_groups(), condition_for_accretion(), and condition_for_merging()
+   can be called safely from parallel regions: each thread gets its own
+   copies of obj1/obj2, particle_name, and good_particle.            */
+#ifdef _OPENMP
+#pragma omp threadprivate(obj1, obj2, particle_name, good_particle)
+#endif
+
 void set_weight(pos_data *);
+
+/* ================================================================
+   3D TILING FOR OpenMP PARALLEL GROUP FORMATION
+   Tile edge T=8 grid spacings: safe for M_max ~ 10^4 particles.
+   With f_a=0.18, max accretion radius = 0.18*(10^4)^(1/3) ~ 3.95 < T/2=4.
+   Colors 0-7 from 8-color 3D checkerboard: no same-color tiles adjacent.
+   ================================================================ */
+#ifdef _OPENMP
+#ifndef TILE_SIZE
+#define TILE_SIZE 8
+#endif
+
+typedef struct {
+  int *particles;  /* frag-order indices in descending Fmax order */
+  int  n;          /* number of particles in this tile             */
+} tile_t;
+
+/* Tile infrastructure: module-level statics, valid between tile_build and tile_free */
+static tile_t  *tiles_g        = NULL;
+static int      n_tiles_g      = 0;
+static int      NT_g[3]        = {0,0,0};
+static int     *color_list_g[8];
+static int      color_cnt_g[8];
+
+/**
+ * @brief Build per-tile particle lists and 8-color index arrays.
+ *
+ * Partitions particles in frag-order range [from_z, to_z] into tiles
+ * of edge T grid spacings. Tiles are classified into 8 colors by their
+ * (tx%2, ty%2, tz%2) checkerboard index.  Within each tile the
+ * particles appear in descending Fmax order because the outer loop
+ * iterates in that order.
+ *
+ * @param from_z  First frag-order index to include (inclusive).
+ * @param to_z    Last  frag-order index to include (inclusive).
+ * @param T       Tile edge length in grid spacings.
+ */
+static void tile_build(int from_z, int to_z, int T)
+{
+  int i, tid, color, ix, iy, iz_t;
+  int *cnt;
+
+  NT_g[0] = (subbox.Lgwbl[0] + T - 1) / T;
+  NT_g[1] = (subbox.Lgwbl[1] + T - 1) / T;
+  NT_g[2] = (subbox.Lgwbl[2] + T - 1) / T;
+  n_tiles_g = NT_g[0] * NT_g[1] * NT_g[2];
+
+  tiles_g = (tile_t *)calloc(n_tiles_g, sizeof(tile_t));
+  cnt     = (int     *)calloc(n_tiles_g, sizeof(int));
+  if (!tiles_g || !cnt)
+    {
+      fprintf(stderr, "tile_build: out of memory\n");
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+  /* Pass 1: count particles per tile */
+  for (i = from_z; i <= to_z; i++)
+    {
+      INDEX_TO_COORD(frag_pos[i], ix, iy, iz_t, subbox.Lgwbl);
+      tid = (ix/T)*NT_g[1]*NT_g[2] + (iy/T)*NT_g[2] + (iz_t/T);
+      cnt[tid]++;
+    }
+
+  /* Allocate per-tile particle arrays */
+  for (tid = 0; tid < n_tiles_g; tid++)
+    if (cnt[tid] > 0)
+      {
+        tiles_g[tid].particles = (int *)malloc(cnt[tid] * sizeof(int));
+        if (!tiles_g[tid].particles)
+          {
+            fprintf(stderr, "tile_build: out of memory for tile %d\n", tid);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+          }
+      }
+
+  /* Pass 2: fill particle lists in Fmax-descending order (preserved
+     because outer loop runs from_z..to_z in that order)             */
+  memset(cnt, 0, n_tiles_g * sizeof(int));
+  for (i = from_z; i <= to_z; i++)
+    {
+      INDEX_TO_COORD(frag_pos[i], ix, iy, iz_t, subbox.Lgwbl);
+      tid = (ix/T)*NT_g[1]*NT_g[2] + (iy/T)*NT_g[2] + (iz_t/T);
+      tiles_g[tid].particles[cnt[tid]] = i;
+      cnt[tid]++;
+      tiles_g[tid].n = cnt[tid];
+    }
+  free(cnt);
+
+  /* Organize tiles by 8-color checkerboard index */
+  memset(color_cnt_g, 0, sizeof(color_cnt_g));
+  for (tid = 0; tid < n_tiles_g; tid++)
+    {
+      int tx = tid / (NT_g[1]*NT_g[2]);
+      int ty = (tid % (NT_g[1]*NT_g[2])) / NT_g[2];
+      int tz = tid % NT_g[2];
+      color = (tx%2) | ((ty%2)<<1) | ((tz%2)<<2);
+      color_cnt_g[color]++;
+    }
+  for (color = 0; color < 8; color++)
+    {
+      color_list_g[color] = (int *)malloc(color_cnt_g[color] * sizeof(int));
+      if (!color_list_g[color] && color_cnt_g[color] > 0)
+        {
+          fprintf(stderr, "tile_build: out of memory for color_list %d\n", color);
+          MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+  memset(color_cnt_g, 0, sizeof(color_cnt_g));
+  for (tid = 0; tid < n_tiles_g; tid++)
+    {
+      int tx = tid / (NT_g[1]*NT_g[2]);
+      int ty = (tid % (NT_g[1]*NT_g[2])) / NT_g[2];
+      int tz = tid % NT_g[2];
+      color = (tx%2) | ((ty%2)<<1) | ((tz%2)<<2);
+      color_list_g[color][color_cnt_g[color]++] = tid;
+    }
+}
+
+/**
+ * @brief Free all memory allocated by tile_build().
+ */
+static void tile_free(void)
+{
+  int tid, color;
+  if (tiles_g)
+    {
+      for (tid = 0; tid < n_tiles_g; tid++)
+        free(tiles_g[tid].particles);
+      free(tiles_g);
+      tiles_g = NULL;
+    }
+  for (color = 0; color < 8; color++)
+    {
+      free(color_list_g[color]);
+      color_list_g[color] = NULL;
+    }
+  n_tiles_g = 0;
+}
+#endif /* _OPENMP */
 
 /* ============================================================
    GFLUT: Growth Factor Lookup Tables
@@ -440,6 +587,36 @@ int build_groups(int Npeaks, double zstop, int first_call)
                     START OF THE CYCLE ON COLLAPSED PARTICLES
    ************************************************************************/
 
+#if defined(_OPENMP) && !defined(CLASSIC_FRAGMENTATION)
+  /* ============================================================
+     OPENMP PATH: Main group formation loop.
+     
+     NOTE: The fragmentation loop has a strict temporal dependency:
+     particle i can only accrete onto halos containing a Lagrangian
+     neighbor processed at higher Fmax. This prevents simple loop
+     parallelization with OpenMP across the Fmax-sorted array.
+     
+     The serial Fmax-descending loop is preserved here to guarantee
+     IDENTICAL results to the non-OpenMP build.
+     
+     Parallelism is applied only in the statistics phase (below, at
+     build_groups_statistics) and in the 6-neighbor check inner loop
+     where safe.
+     
+     Future work: wavefront parallelism can be applied when a
+     particle's 6 Lagrangian neighbors all have strictly higher Fmax
+     (i.e., have already been assigned a group). The 3D tiling
+     infrastructure (tile_build/tile_free) is available above for
+     that purpose.
+     ============================================================ */
+  /* Fall through to the serial loop below — results are identical */
+#endif /* defined(_OPENMP) && !defined(CLASSIC_FRAGMENTATION) */
+
+
+  /* ================================================================
+     SERIAL PATH (unchanged from original)
+     Active when: _OPENMP not defined, OR CLASSIC_FRAGMENTATION set.
+     ================================================================ */
   for (this_z=last_z; this_z<nstep; this_z++)
     {
       /* In classic fragmentation the particles must be addressed in
