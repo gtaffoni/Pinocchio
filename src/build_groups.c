@@ -611,8 +611,9 @@ int build_groups(int Npeaks, double zstop, int first_call)
      Lagrangian neighbors.
 
      Thread safety:
-       - ngroups increment / Npeaks check: #pragma omp critical(ngroups_alloc)
-       - groups[FILAMENT].Mass incr/decr:  #pragma omp atomic
+       - ngroups increment / Npeaks check: #pragma omp atomic capture (lock-free)
+       - groups[FILAMENT].Mass incr/decr:  thread-local tl_filament_delta, one
+         atomic add per thread per color pass (eliminates cache-line bouncing)
        - counters[]: thread-local tl_cnt[], reduced via critical at end
        - group_ID[], linking_list[]:  each particle writes its own index
        - groups[my_group] init after critical: thread has sole ownership
@@ -659,8 +660,10 @@ int build_groups(int Npeaks, double zstop, int first_call)
               double tl_d2, tl_r2, tl_ratio, tl_best_ratio;
               int tl_accgrp, tl_to_group = -1, tl_large, tl_small, tl_pos, tl_ifil;
               int tl_my_group;
+              int tl_filament_delta;   /* thread-local FILAMENT.Mass delta */
               unsigned long long tl_cnt[NCOUNTERS];
               memset(tl_cnt, 0, sizeof(tl_cnt));
+              tl_filament_delta = 0;
 
 #pragma omp for schedule(dynamic,1)
               for (tl_ci = 0; tl_ci < color_cnt_g[tcolor]; tl_ci++)
@@ -802,14 +805,16 @@ int build_groups(int Npeaks, double zstop, int first_call)
                         {
                           if (good_particle) tl_cnt[0]++;
 
-#pragma omp critical(ngroups_alloc)
-                          {
-                            ngroups++;
-                            if (ngroups > Npeaks + 2)
-                              par_error = 1;
-                            tl_my_group = ngroups;
-                          }
+                          /* Lock-free peak allocation via atomic capture.
+                             LOCK XADD on x86 / LDADD on ARM — zero wait.    */
+#pragma omp atomic capture
+                          tl_my_group = ++ngroups;
 
+                          if (tl_my_group > Npeaks + 2)
+                            {
+#pragma omp atomic write
+                              par_error = 1;
+                            }
                           if (par_error) break;
 
                           /* Init new group — thread has exclusive ownership
@@ -896,8 +901,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                           else
                             {
                               if (good_particle) tl_cnt[12]++;
-#pragma omp atomic
-                              groups[FILAMENT].Mass++;
+                              tl_filament_delta++;
                               group_ID[tl_iz]     = FILAMENT;
                               linking_list[tl_iz] = tl_iz;
                             }
@@ -1030,8 +1034,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                               else
                                 {
                                   if (good_particle) tl_cnt[12]++;
-#pragma omp atomic
-                                  groups[FILAMENT].Mass++;
+                                  tl_filament_delta++;
                                   group_ID[tl_iz]     = FILAMENT;
                                   linking_list[tl_iz] = tl_iz;
                                 }
@@ -1042,8 +1045,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                       else
                         {
                           if (good_particle) tl_cnt[12]++;
-#pragma omp atomic
-                          groups[FILAMENT].Mass++;
+                          tl_filament_delta++;
                           group_ID[tl_iz]     = FILAMENT;
                           linking_list[tl_iz] = tl_iz;
                         }
@@ -1075,8 +1077,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                           tl_fil_list[tl_ifil][2],
                                           tl_fil_list[tl_ifil][3],
                                           frag[tl_iz].Fmax);
-#pragma omp atomic
-                                groups[FILAMENT].Mass--;
+                                tl_filament_delta--;
 
                                 if (tl_fil_list[tl_ifil][0] >= subbox.safe[_x_] &&
                                     tl_fil_list[tl_ifil][0] <
@@ -1097,6 +1098,12 @@ int build_groups(int Npeaks, double zstop, int first_call)
 
                     } /* end particle loop within tile */
                 } /* end omp for over tiles */
+
+              /* Flush thread-local FILAMENT.Mass delta — one atomic per thread
+                 per color pass instead of one per filament event.              */
+#pragma omp atomic
+              groups[FILAMENT].Mass += tl_filament_delta;
+              tl_filament_delta = 0;
 
               /* Reduce thread-local counters into global after each color pass */
 #pragma omp critical(counters_reduce)
