@@ -70,6 +70,12 @@ void set_weight(pos_data *);
 #ifndef TILE_SIZE
 #define TILE_SIZE 8
 #endif
+/* Local buffer dimensions: tile + 1-cell shell on each side */
+#define LS   (TILE_SIZE + 2)        /* buffer side length: 10 for TILE_SIZE=8  */
+#define LS2  (LS * LS)              /* 100                                     */
+#define LS3  (LS * LS * LS)         /* 1000                                    */
+/* Index into the local buffer for local coords (li,lj,lk) ∈ [0,LS)          */
+#define LIDX(li,lj,lk) ((li)*LS2 + (lj)*LS + (lk))
 
 typedef struct {
   int *particles;  /* frag-order indices in descending Fmax order */
@@ -196,6 +202,87 @@ static void tile_free(void)
       color_list_g[color] = NULL;
     }
   n_tiles_g = 0;
+}
+
+/**
+ * @brief Fill thread-local cache buffers for one tile + 1-cell shell.
+ *
+ * Copies group_ID[] and frag[].Fmax into compact local arrays so that
+ * the 6-neighbor accesses during tile processing hit L1 cache instead
+ * of random DRAM locations.
+ *
+ * Buffer layout: tl_local_*[LIDX(li,lj,lk)] where (li,lj,lk) ∈ [0,LS).
+ * li=0 corresponds to grid column sx-1, li=LS-1 to sx+TILE_SIZE.
+ * Boundary wrapping follows subbox PBC flags; out-of-domain slots are
+ * filled with (gid=0, fmax=0) which are safe sentinel values.
+ *
+ * @param sx            Tile start coordinate (x), in subbox grid units.
+ * @param sy            Tile start coordinate (y).
+ * @param sz            Tile start coordinate (z).
+ * @param tl_local_gid  Output: group_ID values, size LS3.
+ * @param tl_local_fmax Output: Fmax values, size LS3.
+ */
+static inline void fill_local_buffer(
+    int sx, int sy, int sz,
+    int *tl_local_gid, PRODFLOAT *tl_local_fmax)
+{
+  const int *Lgwbl = subbox.Lgwbl;
+  int li, lj, lk;
+
+  for (li = 0; li < LS; li++)
+    {
+      int gi  = sx - 1 + li;
+      int gii = gi;
+      int vi  = 1;
+      if (gi < 0)
+        { if (subbox.pbc[_x_]) gii = gi + Lgwbl[_x_]; else vi = 0; }
+      else if (gi >= Lgwbl[_x_])
+        { if (subbox.pbc[_x_]) gii = gi - Lgwbl[_x_]; else vi = 0; }
+
+      for (lj = 0; lj < LS; lj++)
+        {
+          int gj  = sy - 1 + lj;
+          int gjj = gj;
+          int vj  = 1;
+          if (gj < 0)
+            { if (subbox.pbc[_y_]) gjj = gj + Lgwbl[_y_]; else vj = 0; }
+          else if (gj >= Lgwbl[_y_])
+            { if (subbox.pbc[_y_]) gjj = gj - Lgwbl[_y_]; else vj = 0; }
+
+          for (lk = 0; lk < LS; lk++)
+            {
+              int gk  = sz - 1 + lk;
+              int gkk = gk;
+              int vk  = 1;
+              if (gk < 0)
+                { if (subbox.pbc[_z_]) gkk = gk + Lgwbl[_z_]; else vk = 0; }
+              else if (gk >= Lgwbl[_z_])
+                { if (subbox.pbc[_z_]) gkk = gk - Lgwbl[_z_]; else vk = 0; }
+
+              int lidx = LIDX(li, lj, lk);
+              if (vi && vj && vk)
+                {
+                  int gpos = COORD_TO_INDEX(gii, gjj, gkk, Lgwbl);
+                  int fp   = sorted_pos[gpos];
+                  if (fp >= 0)
+                    {
+                      tl_local_gid [lidx] = group_ID[fp];
+                      tl_local_fmax[lidx] = frag[fp].Fmax;
+                    }
+                  else
+                    {
+                      tl_local_gid [lidx] = 0;
+                      tl_local_fmax[lidx] = (PRODFLOAT)0;
+                    }
+                }
+              else
+                {
+                  tl_local_gid [lidx] = 0;
+                  tl_local_fmax[lidx] = (PRODFLOAT)0;
+                }
+            }
+        }
+    }
 }
 #endif /* _OPENMP */
 
@@ -662,6 +749,10 @@ int build_groups(int Npeaks, double zstop, int first_call)
               int tl_my_group;
               int tl_filament_delta;   /* thread-local FILAMENT.Mass delta */
               unsigned long long tl_cnt[NCOUNTERS];
+              /* Local cache buffers: tile + 1-cell shell, fits in L1 (8 KB) */
+              int       tl_local_gid [LS3];
+              PRODFLOAT tl_local_fmax[LS3];
+              int tile_sx, tile_sy, tile_sz; /* tile start coords for this tile */
               memset(tl_cnt, 0, sizeof(tl_cnt));
               tl_filament_delta = 0;
 
@@ -673,6 +764,15 @@ int build_groups(int Npeaks, double zstop, int first_call)
 
                   int tl_tid = color_list_g[tcolor][tl_ci];
                   tile_t *tile = &tiles_g[tl_tid];
+
+                  /* Compute tile start coordinates from tile ID */
+                  tile_sx = (tl_tid / (NT_g[1]*NT_g[2]))       * TILE_SIZE;
+                  tile_sy = ((tl_tid / NT_g[2]) % NT_g[1])     * TILE_SIZE;
+                  tile_sz = (tl_tid % NT_g[2])                  * TILE_SIZE;
+
+                  /* Pre-load tile + shell into L1-sized local buffers */
+                  fill_local_buffer(tile_sx, tile_sy, tile_sz,
+                                    tl_local_gid, tl_local_fmax);
 
                   /* Process particles in this tile in Fmax-descending order */
                   for (tl_pi = 0; tl_pi < tile->n; tl_pi++)
@@ -715,33 +815,47 @@ int build_groups(int Npeaks, double zstop, int first_call)
                          tl_kbox >= subbox.safe[_z_] &&
                          tl_kbox <  subbox.Lgwbl[_z_] - subbox.safe[_z_]);
 
+                      /* Own position in local buffer — valid for every particle in tile,
+                         used in 6-neighbor loop and in post-particle buffer update.       */
+                      int tl_li_own = tl_ibox - tile_sx + 1;
+                      int tl_lj_own = tl_jbox - tile_sy + 1;
+                      int tl_lk_own = tl_kbox - tile_sz + 1;
+
                       if (!tl_skip)
                         {
                           tl_peak_cond = 1;
 
                           /* === 6-NEIGHBOR LOOP === */
+
                           for (tl_nn = 0; tl_nn < NV; tl_nn++)
                             {
+                              /* tl_lidx: index into local buffer (pre-PBC offset)
+                                 tl_i1/j1/k1: PBC-wrapped grid coords (for filament) */
+                              int tl_lidx;
                               switch (tl_nn)
                                 {
                                 case 0:
+                                  tl_lidx = LIDX(tl_li_own-1, tl_lj_own, tl_lk_own);
                                   tl_i1 = (subbox.pbc[_x_] && tl_ibox == 0 ?
                                            subbox.Lgwbl[_x_]-1 : tl_ibox-1);
                                   tl_j1 = tl_jbox; tl_k1 = tl_kbox;
                                   break;
                                 case 1:
+                                  tl_lidx = LIDX(tl_li_own+1, tl_lj_own, tl_lk_own);
                                   tl_i1 = (subbox.pbc[_x_] &&
                                            tl_ibox == subbox.Lgwbl[_x_]-1 ?
                                            0 : tl_ibox+1);
                                   tl_j1 = tl_jbox; tl_k1 = tl_kbox;
                                   break;
                                 case 2:
+                                  tl_lidx = LIDX(tl_li_own, tl_lj_own-1, tl_lk_own);
                                   tl_i1 = tl_ibox;
                                   tl_j1 = (subbox.pbc[_y_] && tl_jbox == 0 ?
                                            subbox.Lgwbl[_y_]-1 : tl_jbox-1);
                                   tl_k1 = tl_kbox;
                                   break;
                                 case 3:
+                                  tl_lidx = LIDX(tl_li_own, tl_lj_own+1, tl_lk_own);
                                   tl_i1 = tl_ibox;
                                   tl_j1 = (subbox.pbc[_y_] &&
                                            tl_jbox == subbox.Lgwbl[_y_]-1 ?
@@ -749,34 +863,36 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                   tl_k1 = tl_kbox;
                                   break;
                                 case 4:
+                                  tl_lidx = LIDX(tl_li_own, tl_lj_own, tl_lk_own-1);
                                   tl_i1 = tl_ibox; tl_j1 = tl_jbox;
                                   tl_k1 = (subbox.pbc[_z_] && tl_kbox == 0 ?
                                            subbox.Lgwbl[_z_]-1 : tl_kbox-1);
                                   break;
                                 case 5:
+                                  tl_lidx = LIDX(tl_li_own, tl_lj_own, tl_lk_own+1);
                                   tl_i1 = tl_ibox; tl_j1 = tl_jbox;
                                   tl_k1 = (subbox.pbc[_z_] &&
                                            tl_kbox == subbox.Lgwbl[_z_]-1 ?
                                            0 : tl_kbox+1);
                                   break;
                                 default:
-                                  tl_i1 = tl_j1 = tl_k1 = 0; /* unreachable */
+                                  tl_lidx = 0; tl_i1 = tl_j1 = tl_k1 = 0; /* unreachable */
                                 }
 
-                              /* find_location returns frag-order index, or -1 */
-                              tl_pos = find_location(tl_i1, tl_j1, tl_k1);
-                              if (tl_pos >= 0)
-                                {
-                                  tl_neigh[tl_nn] = group_ID[tl_pos];
-                                  tl_peak_cond &=
-                                    (frag[tl_iz].Fmax > frag[tl_pos].Fmax);
-                                }
-                              else
-                                tl_neigh[tl_nn] = 0;
+                              /* Read neighbor state from L1-cached local buffer.
+                                 tl_local_fmax > 0 iff a collapsed particle exists at
+                                 that position (fill_local_buffer stores 0 when fp<0). */
+                              int tl_ngid         = tl_local_gid [tl_lidx];
+                              PRODFLOAT tl_nfmax  = tl_local_fmax[tl_lidx];
+                              tl_neigh[tl_nn] = tl_ngid;
+                              if (tl_nfmax > (PRODFLOAT)0)
+                                tl_peak_cond &= (frag[tl_iz].Fmax > tl_nfmax);
 
-                              if (tl_neigh[tl_nn] == FILAMENT)
+                              if (tl_ngid == FILAMENT)
                                 {
                                   tl_neigh[tl_nn] = 0;
+                                  /* For filament accretion we need the frag-order index */
+                                  tl_pos = find_location(tl_i1, tl_j1, tl_k1);
                                   tl_fil_list[tl_nf][0] = tl_i1;
                                   tl_fil_list[tl_nf][1] = tl_j1;
                                   tl_fil_list[tl_nf][2] = tl_k1;
@@ -988,6 +1104,15 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                       for (tl_ig3 = 0; tl_ig3 < tl_neigrp; tl_ig3++)
                                         if (tl_neigh[tl_ig3] == tl_small)
                                           tl_neigh[tl_ig3] = tl_large;
+                                      /* Sync local buffer: replace absorbed grp with
+                                         surviving grp so future tile particles don't
+                                         see stale (invalidated) group IDs.           */
+                                      {
+                                        int tl_bk;
+                                        for (tl_bk = 0; tl_bk < LS3; tl_bk++)
+                                          if (tl_local_gid[tl_bk] == tl_small)
+                                            tl_local_gid[tl_bk] = tl_large;
+                                      }
                                       if (groups[tl_large].Mass <
                                           5 * groups[tl_small].Mass && good_particle)
                                         tl_cnt[11]++;
@@ -1077,6 +1202,16 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                           tl_fil_list[tl_ifil][2],
                                           tl_fil_list[tl_ifil][3],
                                           frag[tl_iz].Fmax);
+                                /* Update local buffer: filament particle now belongs to tl_to_group */
+                                {
+                                  int tl_fli = tl_fil_list[tl_ifil][0] - (tile_sx - 1);
+                                  int tl_flj = tl_fil_list[tl_ifil][1] - (tile_sy - 1);
+                                  int tl_flk = tl_fil_list[tl_ifil][2] - (tile_sz - 1);
+                                  if (tl_fli >= 0 && tl_fli < LS &&
+                                      tl_flj >= 0 && tl_flj < LS &&
+                                      tl_flk >= 0 && tl_flk < LS)
+                                    tl_local_gid[LIDX(tl_fli, tl_flj, tl_flk)] = tl_to_group;
+                                }
                                 tl_filament_delta--;
 
                                 if (tl_fil_list[tl_ifil][0] >= subbox.safe[_x_] &&
@@ -1095,6 +1230,11 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                   }
                               }
                         } /* end filament accretion */
+
+                      /* Update local buffer with this particle's final group_ID
+                         so subsequent particles in the same tile see it.        */
+                      tl_local_gid[LIDX(tl_li_own, tl_lj_own, tl_lk_own)] =
+                        group_ID[tl_iz];
 
                     } /* end particle loop within tile */
                 } /* end omp for over tiles */
