@@ -168,7 +168,7 @@ int fragment_driver()
 
 int fragment()
 {
-  /* This function is the driver for fragmentation of collapsed medium 
+  /* This function is the driver for fragmentation of collapsed medium
      and construction of halo catalogs */
 
   int Npeaks, Ngood;
@@ -178,6 +178,7 @@ int fragment()
   double BestPredPeakFactor;
   unsigned long long mynadd[2], nadd_all[2];
   double tmp;
+
 
   /* timing */
   cputime.frag=MPI_Wtime();
@@ -405,6 +406,22 @@ int fragment()
 	{
 	  /* full fragmentation is done segmenting the redshift interval */
 
+#ifdef USE_FASTFRAG
+	  /* FastFrag 8-pass subvolume fragmentation */
+	  tmp=MPI_Wtime();
+	  if (!ThisTask)
+	    printf("[%s] Starting FastFrag 8-pass subvolume fragmentation\n",fdate());
+
+	  if (fragment_fastfrag())
+	    return 1;
+
+	  tmp=MPI_Wtime()-tmp;
+	  cputime.group+=tmp;
+	  if (!ThisTask)
+	    printf("[%s] FastFrag fragmentation done, cputime = %14.6f\n",fdate(),tmp);
+
+#else /* !USE_FASTFRAG */
+
 	  /* Initialize GFLUT tables for thread-safe growth factor lookups.
 	     The range covers z=0 to the maximum Fmax in the particle list. */
 	  {
@@ -471,6 +488,7 @@ int fragment()
 		       fdate(),ScaleDep.z[mysegment],tmp);
 	      cputime.group+=tmp;
 	    }
+#endif /* USE_FASTFRAG */
 	}
     }
 
@@ -1115,4 +1133,556 @@ int estimate_file_size(void)
   return 0;
 }
 
+
+#ifdef USE_FASTFRAG
+
+/* ============================================================
+   FastFrag: 8-pass subvolume fragmentation
+   Ported from src_fastfrag/fragment.c with debug I/O removed.
+   ============================================================ */
+
+/* Macro for periodic/non-periodic boundary coordinate clamping */
+#define SET_PBC_FF(I,F,L) ( (F?((I)+(L))%(L):(I)) )
+
+/* comparison function for sorting global group list by t_peak (descending) */
+static int ff_index_compare_F(const void *a, const void *b)
+{
+  double ta = groups[*((const int *)a)].t_peak;
+  double tb = groups[*((const int *)b)].t_peak;
+  if (ta == tb) return 0;
+  return (ta > tb) ? -1 : 1;
+}
+
+/**
+ * @brief Count Fmax peaks inside a subvolume (excluding the 1-particle border).
+ *
+ * @param[in] v  Pointer to the initialised volume_data structure.
+ * @return Number of local maxima of Fmax above outputs.Flast.
+ */
+int count_peaks_v(volume_data *v)
+{
+  int i, j, k, iz, nn, i1, j1, k1;
+  int Npeaks = 0;
+
+  for (iz = 0; iz < (int)v->Npart; iz++)
+    {
+      INDEX_TO_COORD(iz, i, j, k, v->GridSize);
+
+      /* skip border particles — the border is the overlap region */
+      if (i == 0 || i == v->GridSize[_x_] - 1) continue;
+      if (j == 0 || j == v->GridSize[_y_] - 1) continue;
+      if (k == 0 || k == v->GridSize[_z_] - 1) continue;
+
+      /* skip particles that collapse too late */
+      if (v->Frag[iz].Fmax < outputs.Flast) continue;
+
+      int peak_cond = 1;
+      for (nn = 0; nn < 6; nn++)
+        {
+          switch (nn)
+            {
+            case 0: i1=i-1; j1=j;   k1=k;   break;
+            case 1: i1=i+1; j1=j;   k1=k;   break;
+            case 2: i1=i;   j1=j-1; k1=k;   break;
+            case 3: i1=i;   j1=j+1; k1=k;   break;
+            case 4: i1=i;   j1=j;   k1=k-1; break;
+            case 5: i1=i;   j1=j;   k1=k+1; break;
+            default: i1=i; j1=j; k1=k; break;
+            }
+          peak_cond &= (v->Frag[iz].Fmax >
+                        v->Frag[COORD_TO_INDEX(i1, j1, k1, v->GridSize)].Fmax);
+          if (!peak_cond) break;
+        }
+      if (peak_cond) Npeaks++;
+    }
+  return Npeaks;
+}
+
+
+/**
+ * @brief Convert a volume-local particle index to a subbox index.
+ *
+ * @param[in] pv        Volume-local flat index.
+ * @param[in] my_volume Pointer to the volume_data structure.
+ * @return Flat index in the subbox coordinate frame.
+ */
+static int volume2subbox(int pv, volume_data *my_volume)
+{
+  int iv, jv, kv;
+  INDEX_TO_COORD(pv, iv, jv, kv, my_volume->GridSize);
+
+  int is = SET_PBC_FF(iv + my_volume->Start[_x_],
+                      subbox.pbc[_x_], subbox.Lgwbl[_x_]);
+  int js = SET_PBC_FF(jv + my_volume->Start[_y_],
+                      subbox.pbc[_y_], subbox.Lgwbl[_y_]);
+  int ks = SET_PBC_FF(kv + my_volume->Start[_z_],
+                      subbox.pbc[_z_], subbox.Lgwbl[_z_]);
+
+  return COORD_TO_INDEX(is, js, ks, subbox.Lgwbl);
+}
+
+
+/**
+ * @brief Initialise a subvolume from a slice of the global subbox data.
+ *
+ * The volume arrays are carved out of @p buf (pre-allocated by the caller).
+ * The function fills Frag[] by copying from the global frag[] with periodic
+ * or reflective boundary handling, and sets Npeaks / Ngroups.
+ *
+ * @param[in]  ic,jc,kc       Origin of the sub-cube in subbox coordinates.
+ * @param[in]  sizex,y,z      Dimensions of the sub-cube (including 1-cell border).
+ * @param[out] my_volume      Volume descriptor to populate.
+ * @param[in]  buf            Pre-allocated memory buffer.
+ * @param[in]  bufsz          Size of buf in bytes (for safety check).
+ * @return 0 on success, 1 on error.
+ */
+int initialize_volume(int ic, int jc, int kc,
+                      int sizex, int sizey, int sizez,
+                      volume_data *my_volume,
+                      char *buf, size_t bufsz)
+{
+  my_volume->Start[_x_] = ic;
+  my_volume->Start[_y_] = jc;
+  my_volume->Start[_z_] = kc;
+
+  my_volume->GridSize[0] = sizex;
+  my_volume->GridSize[1] = sizey;
+  my_volume->GridSize[2] = sizez;
+  my_volume->Npart = (unsigned int)sizex * sizey * sizez;
+
+  /* Carve out array pointers from the buffer */
+  size_t need = (size_t)my_volume->Npart *
+                (sizeof(product_data) + 2 * sizeof(int) + sizeof(group_data));
+  if (need > bufsz)
+    {
+      if (!ThisTask)
+        printf("ERROR [initialize_volume]: buffer too small: need %zu, have %zu\n",
+               need, bufsz);
+      return 1;
+    }
+
+  memset(buf, 0, need);
+
+  size_t off = 0;
+  my_volume->Frag         = (product_data *)(buf + off);
+  off += (size_t)my_volume->Npart * sizeof(product_data);
+  my_volume->Group_ID     = (int *)(buf + off);
+  off += (size_t)my_volume->Npart * sizeof(int);
+  my_volume->Linking_list = (int *)(buf + off);
+  off += (size_t)my_volume->Npart * sizeof(int);
+  my_volume->Groups       = (group_data *)(buf + off);
+
+  /* Copy frag data from subbox into volume, honouring PBCs */
+  for (int iv = 0; iv < sizex; iv++)
+    {
+      int ib = SET_PBC_FF(iv + ic, subbox.pbc[_x_], subbox.Lgwbl[_x_]);
+      for (int jv = 0; jv < sizey; jv++)
+        {
+          int jb = SET_PBC_FF(jv + jc, subbox.pbc[_y_], subbox.Lgwbl[_y_]);
+          for (int kv = 0; kv < sizez; kv++)
+            {
+              int kb = SET_PBC_FF(kv + kc, subbox.pbc[_z_], subbox.Lgwbl[_z_]);
+              int posv = COORD_TO_INDEX(iv, jv, kv, my_volume->GridSize);
+              int posb = COORD_TO_INDEX(ib, jb, kb, subbox.Lgwbl);
+              memcpy(my_volume->Frag + posv, frag + posb, sizeof(product_data));
+            }
+        }
+    }
+
+  my_volume->Npeaks  = (unsigned int)count_peaks_v(my_volume);
+  my_volume->Ngroups = my_volume->Npeaks + FILAMENT + 1;
+
+  return 0;
+}
+
+
+/**
+ * @brief Merge the group catalogue from a processed subvolume into the global one.
+ *
+ * For each halo in the volume catalogue that is safely far from the volume
+ * border (distance / M^{1/3} > R_THR and distance > A_THR), its full merger
+ * tree is transplanted into the global groups[] array.  Otherwise only the
+ * Mass and distance fields are updated.
+ *
+ * @param[in,out] my_volume  The processed volume (Frag, Groups, Group_ID,
+ *                            Linking_list already filled by build_groups_in_volume).
+ * @return 0 on success.
+ */
+int merge_catalogs(volume_data *my_volume)
+{
+#define R_THR_FF 2
+#define A_THR_FF 9
+
+  int i, j, k, dist, dist2;
+
+  /* Compute the minimum distance from the volume border for each halo */
+  for (int pos = 0; pos < (int)my_volume->Npart; pos++)
+    {
+      if (my_volume->Group_ID[pos] > FILAMENT)
+        {
+          INDEX_TO_COORD(pos, i, j, k, my_volume->GridSize);
+          dist = i;
+          dist2 = my_volume->GridSize[_x_] - i - 1;
+          if (dist2 < dist) dist = dist2;
+          dist2 = j;
+          if (dist2 < dist) dist = dist2;
+          dist2 = my_volume->GridSize[_y_] - j - 1;
+          if (dist2 < dist) dist = dist2;
+          dist2 = k;
+          if (dist2 < dist) dist = dist2;
+          dist2 = my_volume->GridSize[_z_] - k - 1;
+          if (dist2 < dist) dist = dist2;
+
+          my_volume->Groups[my_volume->Group_ID[pos]].aux2 = dist;
+        }
+    }
+
+  /* Sort the global group list in decreasing t_peak order */
+  for (int gi = 0; gi < ngroups; gi++)
+    indices[gi] = gi;
+  qsort((void *)indices, ngroups, sizeof(int), ff_index_compare_F);
+
+  /* Match volume group list with global list; both sorted by t_peak */
+  int p = 0;
+  for (int gvol = FILAMENT + 1; gvol < (int)my_volume->Ngroups; gvol++)
+    {
+      /* Advance global pointer until we find the matching peak */
+      while (p < ngroups &&
+             groups[indices[p]].name != my_volume->Groups[gvol].name &&
+             groups[indices[p]].t_peak >= my_volume->Groups[gvol].t_peak &&
+             groups[indices[p]].t_peak >= outputs.Flast)
+        p++;
+
+      if (p < ngroups &&
+          groups[indices[p]].name == my_volume->Groups[gvol].name)
+        {
+          /* Matching peak found — store global index in aux1 */
+          my_volume->Groups[gvol].aux1 = indices[p];
+        }
+      else
+        {
+          /* Halo not in global list — this should not happen in a
+             correctly constructed 8-pass tiling, but handle gracefully */
+          if (ngroups < subbox.PredNpeaks)
+            {
+              my_volume->Groups[gvol].aux1 = ngroups;
+              groups[ngroups].aux2  = 0;
+              groups[ngroups].good  = 0;
+              ngroups++;
+            }
+          else
+            {
+              /* No space left — silently skip */
+              my_volume->Groups[gvol].aux1 = FILAMENT;
+              continue;
+            }
+        }
+    }
+
+  /* Update the global catalogue from the volume catalogue */
+  for (int gvol = FILAMENT + 1; gvol < (int)my_volume->Ngroups; gvol++)
+    {
+      int global = my_volume->Groups[gvol].aux1;
+
+      /* Skip invalid matches */
+      if (global <= FILAMENT || global >= ngroups)
+        continue;
+
+      /* Skip branches that have been merged into their main halo already */
+      if (my_volume->Groups[gvol].halo_app != gvol)
+        continue;
+
+      /* Safety criterion: halo is well-resolved only if it is far
+         enough from the volume border both in absolute and relative terms */
+      int safe_halo = (my_volume->Groups[gvol].aux2 /
+                       pow((double)my_volume->Groups[gvol].Mass, 1.0/3.0)
+                       > R_THR_FF &&
+                       my_volume->Groups[gvol].aux2 > A_THR_FF);
+
+      if (safe_halo)
+        {
+          /* Transplant the full merger tree from volume to global catalogue */
+          int next = gvol;
+          do
+            {
+              int gnext = my_volume->Groups[next].aux1;
+              /* Copy entire group_data structure */
+              memcpy(groups + gnext, my_volume->Groups + next, sizeof(group_data));
+              /* Fix linked-list pointers: translate volume indices to global */
+              groups[gnext].ll =
+                my_volume->Groups[my_volume->Groups[next].ll].aux1;
+              groups[gnext].halo_app =
+                my_volume->Groups[my_volume->Groups[next].halo_app].aux1;
+              groups[gnext].merged_with =
+                my_volume->Groups[my_volume->Groups[next].merged_with].aux1;
+              groups[gnext].good = 1;
+
+              next = my_volume->Groups[next].ll;
+            }
+          while (next != gvol);
+
+          /* Rebuild particle linking list in subbox frame */
+          int pv = my_volume->Groups[gvol].point;
+          int ps = volume2subbox(pv, my_volume);
+          groups[global].point = ps;
+          do
+            {
+              if (pv == my_volume->Groups[gvol].bottom)
+                groups[global].bottom = ps;
+
+              /* Mark particle as processed */
+              group_ID[ps]   = global;
+              frag[ps].Rmax  = -1;
+
+              int pv_next = my_volume->Linking_list[pv];
+              int ps_next = volume2subbox(pv_next, my_volume);
+              linking_list[ps] = ps_next;
+
+              pv = pv_next;
+              ps = ps_next;
+            }
+          while (pv != my_volume->Groups[gvol].point);
+        }
+      else
+        {
+          /* Only update mass and border distance in the global entry */
+          groups[global].Mass = my_volume->Groups[gvol].Mass;
+          groups[global].aux2 = my_volume->Groups[gvol].aux2;
+        }
+    }
+
+#undef R_THR_FF
+#undef A_THR_FF
+  return 0;
+}
+
+
+/**
+ * @brief Pre-identify all Fmax peaks in the full subbox and initialise groups[].
+ *
+ * This is called once before the 8-pass loop.  It populates groups[] with
+ * one entry per local maximum of Fmax (above outputs.Flast) and sets ngroups.
+ * The group entries are minimal: t_peak, name, good=0, point, bottom, ll,
+ * halo_app are set; positions/velocities are NOT set here (they are filled
+ * by build_groups_in_volume + merge_catalogs).
+ *
+ * @return Total number of peaks found.
+ */
+int find_all_peaks(void)
+{
+  int iz, i, j, k, nn, i1, j1, k1, peak_cond;
+  int npeaks_tot = 0;
+
+  /* Initialise group list: index 0 and FILAMENT are reserved */
+  groups[FILAMENT].Mass = 0;
+  ngroups = FILAMENT + 1;
+
+  for (iz = 0; iz < (int)subbox.Nstored; iz++)
+    {
+      if (frag[iz].Fmax < outputs.Flast)
+        continue;
+
+      INDEX_TO_COORD(iz, i, j, k, subbox.Lgwbl);
+
+      /* Skip particles at the subbox border (no PBC wrapping here) */
+      if (!subbox.pbc[_x_] && (i == 0 || i == subbox.Lgwbl[_x_] - 1)) continue;
+      if (!subbox.pbc[_y_] && (j == 0 || j == subbox.Lgwbl[_y_] - 1)) continue;
+      if (!subbox.pbc[_z_] && (k == 0 || k == subbox.Lgwbl[_z_] - 1)) continue;
+
+      peak_cond = 1;
+      for (nn = 0; nn < 6; nn++)
+        {
+          switch (nn)
+            {
+            case 0:
+              i1 = (subbox.pbc[_x_] && i == 0 ? subbox.Lgwbl[_x_] - 1 : i - 1);
+              j1 = j; k1 = k; break;
+            case 1:
+              i1 = (subbox.pbc[_x_] && i == subbox.Lgwbl[_x_] - 1 ? 0 : i + 1);
+              j1 = j; k1 = k; break;
+            case 2:
+              i1 = i;
+              j1 = (subbox.pbc[_y_] && j == 0 ? subbox.Lgwbl[_y_] - 1 : j - 1);
+              k1 = k; break;
+            case 3:
+              i1 = i;
+              j1 = (subbox.pbc[_y_] && j == subbox.Lgwbl[_y_] - 1 ? 0 : j + 1);
+              k1 = k; break;
+            case 4:
+              i1 = i; j1 = j;
+              k1 = (subbox.pbc[_z_] && k == 0 ? subbox.Lgwbl[_z_] - 1 : k - 1);
+              break;
+            case 5:
+              i1 = i; j1 = j;
+              k1 = (subbox.pbc[_z_] && k == subbox.Lgwbl[_z_] - 1 ? 0 : k + 1);
+              break;
+            default: i1 = i; j1 = j; k1 = k; break;
+            }
+          peak_cond &= (frag[iz].Fmax >
+                        frag[COORD_TO_INDEX(i1, j1, k1, subbox.Lgwbl)].Fmax);
+          if (!peak_cond) break;
+        }
+
+      if (peak_cond)
+        {
+          if (ngroups >= subbox.PredNpeaks)
+            {
+              printf("ERROR Task %d [find_all_peaks]: ngroups %d exceeds PredNpeaks %d\n",
+                     ThisTask, ngroups, subbox.PredNpeaks);
+              fflush(stdout);
+              return -1;
+            }
+
+          groups[ngroups].t_peak   = frag[iz].Fmax;
+          groups[ngroups].t_merge  = -1;
+          groups[ngroups].Mass     = 1;
+          groups[ngroups].name     =
+            COORD_TO_INDEX(
+              (long long)((i + subbox.stabl[_x_] + MyGrids[0].GSglobal[_x_]) %
+                          MyGrids[0].GSglobal[_x_]),
+              (long long)((j + subbox.stabl[_y_] + MyGrids[0].GSglobal[_y_]) %
+                          MyGrids[0].GSglobal[_y_]),
+              (long long)((k + subbox.stabl[_z_] + MyGrids[0].GSglobal[_z_]) %
+                          MyGrids[0].GSglobal[_z_]),
+              MyGrids[0].GSglobal);
+          groups[ngroups].good     = 0;
+          groups[ngroups].point    = iz;
+          groups[ngroups].bottom   = iz;
+          groups[ngroups].ll       = ngroups;
+          groups[ngroups].halo_app = ngroups;
+          groups[ngroups].aux2     = 0;
+
+          if (params.MinHaloMass <= 1)
+            groups[ngroups].t_appear = frag[iz].Fmax;
+          else
+            groups[ngroups].t_appear = -1;
+
+          linking_list[iz] = iz;
+          group_ID[iz]     = ngroups;
+
+          ngroups++;
+          npeaks_tot++;
+        }
+    }
+
+  /* Zero out the FILAMENT and reserved entries */
+  for (int gi = 0; gi <= FILAMENT; gi++)
+    groups[gi].name = groups[gi].aux2 = 0;
+  groups[FILAMENT].t_peak = 0;
+
+  return npeaks_tot;
+}
+
+
+/**
+ * @brief 8-pass subvolume fragmentation driver.
+ *
+ * Tiles the MPI subbox into Nsub^3 sub-cubes offset by half a tile in each
+ * combination of x/y/z directions (8 passes total).  Each sub-cube is
+ * initialised, fragmented independently with build_groups_in_volume(), and
+ * merged back into the global catalogue with merge_catalogs().
+ *
+ * @return 0 on success, 1 on error.
+ */
+int fragment_fastfrag(void)
+{
+  /* 8 pass offsets: each coordinate is either 0 or size/2 */
+  static const int pass_offsets[8][3] = {
+    {0, 0, 0},
+    {1, 0, 0},
+    {0, 1, 0},
+    {0, 0, 1},
+    {1, 1, 0},
+    {1, 0, 1},
+    {0, 1, 1},
+    {1, 1, 1}
+  };
+
+  int Nsub = 4;
+  int size = subbox.Lgwbl[_x_] / Nsub;  /* sub-cube side (interior, without border) */
+
+  if (size < 3)
+    {
+      if (!ThisTask)
+        printf("[FastFrag] WARNING: subbox too small for Nsub=%d, forcing Nsub=1\n", Nsub);
+      Nsub = 1;
+      size = subbox.Lgwbl[_x_];
+    }
+
+  /* Allocate a single reusable buffer for all subvolume data.
+     Maximum subvolume size is (size+2)^3. */
+  size_t vol_n   = (size_t)(size + 2) * (size + 2) * (size + 2);
+  size_t vol_sz  = vol_n * (sizeof(product_data) + 2 * sizeof(int) +
+                             sizeof(group_data));
+  char *vol_buf  = (char *)malloc(vol_sz);
+  if (!vol_buf)
+    {
+      printf("ERROR Task %d [fragment_fastfrag]: malloc failed for volume buffer (%zu bytes)\n",
+             ThisTask, vol_sz);
+      fflush(stdout);
+      return 1;
+    }
+
+  if (!ThisTask)
+    printf("[%s] FastFrag: Nsub=%d, size=%d, volume buffer %zu MB\n",
+           fdate(), Nsub, size, vol_sz / (1024 * 1024));
+
+  /* Pre-identify all peaks in the subbox and initialise groups[] */
+  int Npeaks = find_all_peaks();
+  if (Npeaks < 0)
+    {
+      free(vol_buf);
+      return 1;
+    }
+
+  if (!ThisTask)
+    printf("[%s] FastFrag: found %d peaks in subbox\n", fdate(), Npeaks);
+
+  /* 8-pass loop */
+  for (int pass = 0; pass < 8; pass++)
+    {
+      int ox = pass_offsets[pass][0] * (size / 2);
+      int oy = pass_offsets[pass][1] * (size / 2);
+      int oz = pass_offsets[pass][2] * (size / 2);
+
+      for (int is = 0; is < Nsub; is++)
+        for (int js = 0; js < Nsub; js++)
+          for (int ks = 0; ks < Nsub; ks++)
+            {
+              volume_data my_volume;
+
+              int ic = is * size - 1 + ox;
+              int jc = js * size - 1 + oy;
+              int kc = ks * size - 1 + oz;
+
+              if (initialize_volume(ic, jc, kc,
+                                    size + 2, size + 2, size + 2,
+                                    &my_volume, vol_buf, vol_sz))
+                {
+                  free(vol_buf);
+                  return 1;
+                }
+
+              if (build_groups_in_volume(&my_volume))
+                {
+                  free(vol_buf);
+                  return 1;
+                }
+
+              if (merge_catalogs(&my_volume))
+                {
+                  free(vol_buf);
+                  return 1;
+                }
+            }
+
+      if (!ThisTask)
+        printf("[%s] FastFrag: pass %d/%d done\n", fdate(), pass + 1, 8);
+    }
+
+  free(vol_buf);
+  return 0;
+}
+
+#endif /* USE_FASTFRAG */
 

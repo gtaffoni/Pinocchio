@@ -4247,3 +4247,693 @@ int update_map(unsigned int *nadd)
   return 0;
 }
 
+
+#ifdef USE_FASTFRAG
+
+/* ============================================================
+   FastFrag subvolume fragmentation support functions.
+
+   These mirror the global accretion/merge/set_* functions but
+   operate on a volume_data struct instead of the global arrays.
+   The module-level ff_v pointer is set by build_groups_in_volume()
+   before any of these are called.
+   ============================================================ */
+
+/** Module-level pointer to the active volume.  Set by build_groups_in_volume(). */
+static volume_data *ff_v = NULL;
+
+/* qsort comparator: sort volume particle indices by descending Fmax */
+static int ff_index_compare_vol(const void *a, const void *b)
+{
+  PRODFLOAT fa = ff_v->Frag[*((const int *)a)].Fmax;
+  PRODFLOAT fb = ff_v->Frag[*((const int *)b)].Fmax;
+  if (fa == fb) return 0;
+  return (fa > fb) ? -1 : 1;
+}
+
+/* Volume-local set_obj: reads from ff_v->Groups[] */
+static void set_obj_v(int grp, PRODFLOAT F, pos_data *myobj)
+{
+  myobj->M   = ff_v->Groups[grp].Mass;
+  myobj->z   = F - 1.0;
+#ifdef SCALE_DEPENDENT
+  myobj->R   = pow((double)(myobj->M) * 3.0 / 4.0 / PI, 1.0/3.0) *
+               params.InterPartDist;
+  double interp = (1.0 - myobj->R / Smoothing.Rad_GM[0]) *
+                  (double)(Smoothing.Nsmooth - 1);
+  interp = (interp < 0.0 ? 0.0 : interp);
+  int idx = (int)interp;
+  double ww = interp - (double)idx;
+  myobj->myk = pow(10.0, log10(Smoothing.k_GM_displ[idx]) * (1.0 - ww) +
+                         log10(Smoothing.k_GM_displ[idx + 1]) * ww);
+#else
+  myobj->myk = params.k_for_GM;
+#endif
+  set_weight(myobj);
+  myobj->M = ff_v->Groups[grp].Mass;
+  for (int ii = 0; ii < 3; ii++)
+    {
+      myobj->q[ii]  = ff_v->Groups[grp].Pos[ii];
+      myobj->v[ii]  = ff_v->Groups[grp].Vel[ii];
+#ifdef TWO_LPT
+      myobj->v2[ii] = ff_v->Groups[grp].Vel_2LPT[ii];
+#ifdef THREE_LPT
+      myobj->v31[ii] = ff_v->Groups[grp].Vel_3LPT_1[ii];
+      myobj->v32[ii] = ff_v->Groups[grp].Vel_3LPT_2[ii];
+#endif
+#endif
+#ifdef RECOMPUTE_DISPLACEMENTS
+      myobj->v_prev[ii]   = ff_v->Groups[grp].Vel_prev[ii];
+#ifdef TWO_LPT
+      myobj->v2_prev[ii]  = ff_v->Groups[grp].Vel_2LPT_prev[ii];
+#ifdef THREE_LPT
+      myobj->v31_prev[ii] = ff_v->Groups[grp].Vel_3LPT_1_prev[ii];
+      myobj->v32_prev[ii] = ff_v->Groups[grp].Vel_3LPT_2_prev[ii];
+#endif
+#endif
+#endif
+    }
+}
+
+/* Volume-local set_point: reads velocities from ff_v->Frag[] */
+static void set_point_v(int i, int j, int k, int ind, PRODFLOAT F,
+                         pos_data *myobj)
+{
+  myobj->z = F - 1.0;
+#ifdef SCALE_DEPENDENT
+  int S = Smoothing.Nsmooth - 1;
+  myobj->myk = Smoothing.k_GM_displ[S];
+#else
+  myobj->myk = params.k_for_GM;
+#endif
+  set_weight(myobj);
+  myobj->M   = 1;
+  myobj->q[0] = i + SHIFT;
+  myobj->q[1] = j + SHIFT;
+  myobj->q[2] = k + SHIFT;
+  myobj->v[0] = ff_v->Frag[ind].Vel[0];
+  myobj->v[1] = ff_v->Frag[ind].Vel[1];
+  myobj->v[2] = ff_v->Frag[ind].Vel[2];
+#ifdef TWO_LPT
+  myobj->v2[0] = ff_v->Frag[ind].Vel_2LPT[0];
+  myobj->v2[1] = ff_v->Frag[ind].Vel_2LPT[1];
+  myobj->v2[2] = ff_v->Frag[ind].Vel_2LPT[2];
+#ifdef THREE_LPT
+  myobj->v31[0] = ff_v->Frag[ind].Vel_3LPT_1[0];
+  myobj->v31[1] = ff_v->Frag[ind].Vel_3LPT_1[1];
+  myobj->v31[2] = ff_v->Frag[ind].Vel_3LPT_1[2];
+  myobj->v32[0] = ff_v->Frag[ind].Vel_3LPT_2[0];
+  myobj->v32[1] = ff_v->Frag[ind].Vel_3LPT_2[1];
+  myobj->v32[2] = ff_v->Frag[ind].Vel_3LPT_2[2];
+#endif
+#endif
+#ifdef RECOMPUTE_DISPLACEMENTS
+  myobj->v_prev[0] = ff_v->Frag[ind].Vel_prev[0];
+  myobj->v_prev[1] = ff_v->Frag[ind].Vel_prev[1];
+  myobj->v_prev[2] = ff_v->Frag[ind].Vel_prev[2];
+#ifdef TWO_LPT
+  myobj->v2_prev[0] = ff_v->Frag[ind].Vel_2LPT_prev[0];
+  myobj->v2_prev[1] = ff_v->Frag[ind].Vel_2LPT_prev[1];
+  myobj->v2_prev[2] = ff_v->Frag[ind].Vel_2LPT_prev[2];
+#ifdef THREE_LPT
+  myobj->v31_prev[0] = ff_v->Frag[ind].Vel_3LPT_1_prev[0];
+  myobj->v31_prev[1] = ff_v->Frag[ind].Vel_3LPT_1_prev[1];
+  myobj->v31_prev[2] = ff_v->Frag[ind].Vel_3LPT_1_prev[2];
+  myobj->v32_prev[0] = ff_v->Frag[ind].Vel_3LPT_2_prev[0];
+  myobj->v32_prev[1] = ff_v->Frag[ind].Vel_3LPT_2_prev[1];
+  myobj->v32_prev[2] = ff_v->Frag[ind].Vel_3LPT_2_prev[2];
+#endif
+#endif
+#endif
+}
+
+/* Volume-local set_group: writes to ff_v->Groups[] */
+static void set_group_v(int grp, pos_data *myobj)
+{
+  ff_v->Groups[grp].Mass = myobj->M;
+  for (int ii = 0; ii < 3; ii++)
+    {
+      ff_v->Groups[grp].Pos[ii]  = myobj->q[ii];
+      ff_v->Groups[grp].Vel[ii]  = myobj->v[ii];
+#ifdef TWO_LPT
+      ff_v->Groups[grp].Vel_2LPT[ii] = myobj->v2[ii];
+#ifdef THREE_LPT
+      ff_v->Groups[grp].Vel_3LPT_1[ii] = myobj->v31[ii];
+      ff_v->Groups[grp].Vel_3LPT_2[ii] = myobj->v32[ii];
+#endif
+#endif
+#ifdef RECOMPUTE_DISPLACEMENTS
+      ff_v->Groups[grp].Vel_prev[ii]      = myobj->v_prev[ii];
+#ifdef TWO_LPT
+      ff_v->Groups[grp].Vel_2LPT_prev[ii] = myobj->v2_prev[ii];
+#ifdef THREE_LPT
+      ff_v->Groups[grp].Vel_3LPT_1_prev[ii] = myobj->v31_prev[ii];
+      ff_v->Groups[grp].Vel_3LPT_2_prev[ii] = myobj->v32_prev[ii];
+#endif
+#endif
+#endif
+    }
+}
+
+/* Volume-local update_history: uses ff_v->Groups[] */
+static void update_history_v(int g1, int g2, PRODFLOAT time)
+{
+  int old_i;
+  if (ff_v->Groups[g1].ll == g1 && ff_v->Groups[g2].ll == g2)
+    {
+      ff_v->Groups[g1].ll = g2;
+      ff_v->Groups[g2].ll = g1;
+    }
+  else if (ff_v->Groups[g1].ll != g1 && ff_v->Groups[g2].ll == g2)
+    {
+      ff_v->Groups[g2].ll = g1;
+      old_i = g1;
+      while (ff_v->Groups[old_i].ll != g1) old_i = ff_v->Groups[old_i].ll;
+      ff_v->Groups[old_i].ll = g2;
+    }
+  else if (ff_v->Groups[g1].ll == g1 && ff_v->Groups[g2].ll != g2)
+    {
+      old_i = g2;
+      while (ff_v->Groups[old_i].ll != g2)
+        {
+          old_i = ff_v->Groups[old_i].ll;
+          ff_v->Groups[old_i].halo_app = g1;
+        }
+      ff_v->Groups[g2].halo_app = g1;
+      ff_v->Groups[g1].ll = ff_v->Groups[g2].ll;
+      ff_v->Groups[g2].ll = g1;
+    }
+  else
+    {
+      old_i = g2;
+      while (ff_v->Groups[old_i].ll != g2)
+        {
+          old_i = ff_v->Groups[old_i].ll;
+          ff_v->Groups[old_i].halo_app = g1;
+        }
+      old_i = g1;
+      while (ff_v->Groups[old_i].ll != g1) old_i = ff_v->Groups[old_i].ll;
+      ff_v->Groups[old_i].ll = ff_v->Groups[g2].ll;
+      ff_v->Groups[g2].ll    = g1;
+    }
+  ff_v->Groups[g2].halo_app       = g1;
+  ff_v->Groups[g2].t_merge        = time;
+  ff_v->Groups[g2].mass_at_merger = ff_v->Groups[g1].Mass;
+  ff_v->Groups[g2].merged_with    = g1;
+}
+
+/* Volume-local merge_groups: uses ff_v arrays */
+static void merge_groups_v(int grp1, int grp2, PRODFLOAT time)
+{
+  int i1;
+  if (ff_v->Groups[grp1].point < 0 || ff_v->Groups[grp2].point < 0)
+    return;
+
+#ifdef SNAPSHOT
+  if ((ff_v->Groups[grp1].t_appear == -1 || ff_v->Groups[grp2].t_appear == -1)
+      && (ff_v->Groups[grp1].Mass + ff_v->Groups[grp2].Mass >= params.MinHaloMass))
+    {
+      if (ff_v->Groups[grp1].t_appear == -1)
+        {
+          i1 = ff_v->Groups[grp1].point;
+          while (ff_v->Linking_list[i1] != ff_v->Groups[grp1].point)
+            { ff_v->Frag[i1].zacc = time - 1.0; i1 = ff_v->Linking_list[i1]; }
+          ff_v->Frag[i1].zacc = time - 1.0;
+        }
+      if (ff_v->Groups[grp2].t_appear == -1)
+        {
+          i1 = ff_v->Groups[grp2].point;
+          while (ff_v->Linking_list[i1] != ff_v->Groups[grp2].point)
+            { ff_v->Frag[i1].zacc = time - 1.0; i1 = ff_v->Linking_list[i1]; }
+          ff_v->Frag[i1].zacc = time - 1.0;
+        }
+    }
+#endif
+
+  /* Update linking list: reassign grp2 particles to grp1 */
+  i1 = ff_v->Groups[grp2].point;
+  while (ff_v->Linking_list[i1] != ff_v->Groups[grp2].point)
+    {
+      ff_v->Group_ID[i1] = grp1;
+      i1 = ff_v->Linking_list[i1];
+    }
+  ff_v->Group_ID[i1] = grp1;
+
+  /* Join the linking lists */
+  ff_v->Linking_list[ff_v->Groups[grp1].bottom] = ff_v->Groups[grp2].point;
+  ff_v->Linking_list[ff_v->Groups[grp2].bottom] = ff_v->Groups[grp1].point;
+  ff_v->Groups[grp1].bottom = ff_v->Groups[grp2].bottom;
+  ff_v->Groups[grp2].point  = -1;
+  ff_v->Groups[grp2].bottom = -1;
+
+  if (ff_v->Groups[grp1].Mass >= params.MinHaloMass &&
+      ff_v->Groups[grp2].Mass >= params.MinHaloMass)
+    update_history_v(grp1, grp2, time);
+
+  /* Update centre position and mass via the standard update() */
+  set_obj_v(grp1, time, &obj1);
+  set_obj_v(grp2, time, &obj2);
+  update(&obj1, &obj2);
+  set_group_v(grp1, &obj1);
+
+  if (ff_v->Groups[grp1].Mass >= params.MinHaloMass &&
+      ff_v->Groups[grp1].t_appear == -1)
+    ff_v->Groups[grp1].t_appear = time;
+}
+
+/* Volume-local accretion */
+static void accretion_v(int group, int i, int j, int k, int indx, PRODFLOAT F)
+{
+  if (ff_v->Groups[group].point < 0) return;
+
+  set_obj_v(group, F, &obj1);
+  set_point_v(i, j, k, indx, F, &obj2);
+  update(&obj1, &obj2);
+  set_group_v(group, &obj1);
+
+  if (ff_v->Groups[group].Mass >= params.MinHaloMass &&
+      ff_v->Groups[group].t_appear == -1)
+    {
+      ff_v->Groups[group].t_appear = F;
+#ifdef SNAPSHOT
+      int i1 = ff_v->Groups[group].point;
+      while (ff_v->Linking_list[i1] != ff_v->Groups[group].point)
+        { ff_v->Frag[i1].zacc = F - 1.0; i1 = ff_v->Linking_list[i1]; }
+      ff_v->Frag[i1].zacc = F - 1.0;
+#endif
+    }
+
+  ff_v->Group_ID[indx] = group;
+  ff_v->Linking_list[ff_v->Groups[group].bottom] = indx;
+  ff_v->Groups[group].bottom = indx;
+  ff_v->Linking_list[indx]   = ff_v->Groups[group].point;
+
+#ifdef SNAPSHOT
+  if (ff_v->Groups[group].Mass >= params.MinHaloMass)
+    ff_v->Frag[indx].zacc = F - 1.0;
+#endif
+}
+
+/* Volume-local condition_for_accretion */
+static void condition_for_accretion_v(int call, int i, int j, int k, int ind,
+                                       PRODFLOAT Fmax, int grp,
+                                       double *dd, double *rr)
+{
+  (void)call;
+  *rr = virial(ff_v->Groups[grp].Mass, Fmax, 1);
+  *dd = 100.0 * (*rr);
+
+  pos_data o1, o2;
+  set_point_v(i, j, k, ind, Fmax, &o1);
+  set_obj_v(grp, Fmax, &o2);
+
+  double dx = distance(0, &o1, &o2);
+  double d2 = dx * dx;
+  if (d2 < *rr)
+    {
+      double dy = distance(1, &o1, &o2);
+      d2 += dy * dy;
+      if (d2 < *rr)
+        {
+          double dz = distance(2, &o1, &o2);
+          d2 += dz * dz;
+          if (d2 <= *rr) *dd = d2;
+        }
+    }
+}
+
+/* Volume-local condition_for_merging */
+static void condition_for_merging_v(PRODFLOAT Fmax, int grp1, int grp2,
+                                     int *merge_flag)
+{
+  *merge_flag = 0;
+  double rvir1 = virial(ff_v->Groups[grp1].Mass, Fmax, 0);
+  double rvir2 = virial(ff_v->Groups[grp2].Mass, Fmax, 0);
+  double rr    = (rvir1 > rvir2 ? rvir1 : rvir2);
+
+  pos_data o1, o2;
+  set_obj_v(grp1, Fmax, &o1);
+  set_obj_v(grp2, Fmax, &o2);
+
+  double dx = distance(0, &o1, &o2);
+  double dd = dx * dx;
+  if (dd < rr)
+    {
+      double dy = distance(1, &o1, &o2);
+      dd += dy * dy;
+      if (dd < rr)
+        {
+          double dz = distance(2, &o1, &o2);
+          dd += dz * dz;
+          if (dd <= rr) *merge_flag = 1;
+        }
+    }
+}
+
+
+/**
+ * @brief Perform halo fragmentation within a single sub-volume.
+ *
+ * Mirrors the classic build_groups() algorithm but operates entirely on
+ * the local volume_data arrays (Frag, Group_ID, Linking_list, Groups).
+ * A local qsort on the volume particles provides the z_c ordering.
+ * No OpenMP.  No global arrays are written.
+ *
+ * @param[in,out] my_volume  Volume descriptor (must already be initialised
+ *                            by initialize_volume()).
+ * @return 0 on success, 1 on error.
+ */
+int build_groups_in_volume(volume_data *my_volume)
+{
+  ff_v = my_volume;    /* expose volume to helper functions */
+
+  int merge_arr[NV][NV], neigh[NV], fil_list[NV][4];
+  int nn, ifil, this_z, neigrp, nf;
+  int iz, i1, j1, k1, skip;
+  int ig3, small, large, to_group, accgrp, ig1, ig2;
+  int accrflag, nmerge, peak_cond;
+  double ratio, best_ratio, d2, r2;
+  int merge_flag;
+  int ibox, jbox, kbox;
+  int pos;
+
+  /* Initialise volume group list */
+  ff_v->Ngroups = FILAMENT + 1;
+  for (i1 = 0; i1 <= FILAMENT; i1++)
+    {
+      ff_v->Groups[i1].point  = -1;
+      ff_v->Groups[i1].bottom = -1;
+    }
+
+  /* Sort volume particles by descending Fmax.
+     Reuse the global indices[] scratch array (it is not in use here). */
+  for (int pi = 0; pi < (int)ff_v->Npart; pi++)
+    indices[pi] = pi;
+  qsort((void *)indices, ff_v->Npart, sizeof(int), ff_index_compare_vol);
+
+  /* Count collapsed particles */
+  int nstep = 0;
+  while (nstep < (int)ff_v->Npart &&
+         ff_v->Frag[indices[nstep]].Fmax >= outputs.Flast)
+    nstep++;
+
+  /* ================================================================
+     Main loop over collapsed particles in z_c descending order
+     ================================================================ */
+  for (this_z = 0; this_z < nstep; this_z++)
+    {
+      iz = indices[this_z];
+
+      /* Skip already-processed particles */
+      if (ff_v->Frag[iz].Rmax < 0) continue;
+
+      neigrp   = 0;
+      nf       = 0;
+      accrflag = 0;
+      for (i1 = 0; i1 < NV; i1++) neigh[i1] = 0;
+
+      /* Particle coordinates */
+      INDEX_TO_COORD(iz, ibox, jbox, kbox, ff_v->GridSize);
+
+      /* Border check: particles at the volume boundary are not peaks */
+      skip = 0;
+      if (ibox == 0 || ibox == ff_v->GridSize[_x_] - 1) ++skip;
+      if (jbox == 0 || jbox == ff_v->GridSize[_y_] - 1) ++skip;
+      if (kbox == 0 || kbox == ff_v->GridSize[_z_] - 1) ++skip;
+
+      /* Compute the global unique particle name */
+      particle_name =
+        COORD_TO_INDEX(
+          (long long)((ibox + ff_v->Start[_x_] + MyGrids[0].GSglobal[_x_]) %
+                       MyGrids[0].GSglobal[_x_]),
+          (long long)((jbox + ff_v->Start[_y_] + MyGrids[0].GSglobal[_y_]) %
+                       MyGrids[0].GSglobal[_y_]),
+          (long long)((kbox + ff_v->Start[_z_] + MyGrids[0].GSglobal[_z_]) %
+                       MyGrids[0].GSglobal[_z_]),
+          MyGrids[0].GSglobal);
+
+      if (!skip)
+        {
+          peak_cond = 1;
+          for (nn = 0; nn < NV; nn++)
+            {
+              switch (nn)
+                {
+                case 0: i1=ibox-1; j1=jbox;   k1=kbox;   break;
+                case 1: i1=ibox+1; j1=jbox;   k1=kbox;   break;
+                case 2: i1=ibox;   j1=jbox-1; k1=kbox;   break;
+                case 3: i1=ibox;   j1=jbox+1; k1=kbox;   break;
+                case 4: i1=ibox;   j1=jbox;   k1=kbox-1; break;
+                case 5: i1=ibox;   j1=jbox;   k1=kbox+1; break;
+                default: i1=ibox; j1=jbox; k1=kbox; break;
+                }
+              pos = COORD_TO_INDEX(i1, j1, k1, ff_v->GridSize);
+              neigh[nn] = ff_v->Group_ID[pos];
+              peak_cond &= (ff_v->Frag[iz].Fmax > ff_v->Frag[pos].Fmax);
+
+              if (neigh[nn] == FILAMENT)
+                {
+                  neigh[nn]       = 0;
+                  fil_list[nf][0] = i1;
+                  fil_list[nf][1] = j1;
+                  fil_list[nf][2] = k1;
+                  fil_list[nf][3] = pos;
+                  nf++;
+                }
+            }
+
+          /* Remove duplicate neighbours */
+          clean_list(neigh);
+
+          /* Count distinct neighbouring groups */
+          for (nn = neigrp = 0; nn < NV; nn++)
+            if (neigh[nn] > FILAMENT) neigrp++;
+        }
+      else
+        {
+          peak_cond = 0;
+          neigrp    = 0;
+        }
+
+      /* ============================================================ */
+      if (peak_cond)
+        {
+          /* CASE 1: Peak — create a new one-particle group */
+          int ng = (int)ff_v->Ngroups;
+          ff_v->Groups[ng].t_peak   = ff_v->Frag[iz].Fmax;
+          ff_v->Groups[ng].t_merge  = -1;
+          ff_v->Groups[ng].Pos[0]   = ibox + SHIFT;
+          ff_v->Groups[ng].Pos[1]   = jbox + SHIFT;
+          ff_v->Groups[ng].Pos[2]   = kbox + SHIFT;
+          ff_v->Groups[ng].Vel[0]   = ff_v->Frag[iz].Vel[0];
+          ff_v->Groups[ng].Vel[1]   = ff_v->Frag[iz].Vel[1];
+          ff_v->Groups[ng].Vel[2]   = ff_v->Frag[iz].Vel[2];
+#ifdef TWO_LPT
+          ff_v->Groups[ng].Vel_2LPT[0] = ff_v->Frag[iz].Vel_2LPT[0];
+          ff_v->Groups[ng].Vel_2LPT[1] = ff_v->Frag[iz].Vel_2LPT[1];
+          ff_v->Groups[ng].Vel_2LPT[2] = ff_v->Frag[iz].Vel_2LPT[2];
+#ifdef THREE_LPT
+          ff_v->Groups[ng].Vel_3LPT_1[0] = ff_v->Frag[iz].Vel_3LPT_1[0];
+          ff_v->Groups[ng].Vel_3LPT_1[1] = ff_v->Frag[iz].Vel_3LPT_1[1];
+          ff_v->Groups[ng].Vel_3LPT_1[2] = ff_v->Frag[iz].Vel_3LPT_1[2];
+          ff_v->Groups[ng].Vel_3LPT_2[0] = ff_v->Frag[iz].Vel_3LPT_2[0];
+          ff_v->Groups[ng].Vel_3LPT_2[1] = ff_v->Frag[iz].Vel_3LPT_2[1];
+          ff_v->Groups[ng].Vel_3LPT_2[2] = ff_v->Frag[iz].Vel_3LPT_2[2];
+#endif
+#endif
+#ifdef RECOMPUTE_DISPLACEMENTS
+          ff_v->Groups[ng].Vel_prev[0]        = ff_v->Frag[iz].Vel_prev[0];
+          ff_v->Groups[ng].Vel_prev[1]        = ff_v->Frag[iz].Vel_prev[1];
+          ff_v->Groups[ng].Vel_prev[2]        = ff_v->Frag[iz].Vel_prev[2];
+#ifdef TWO_LPT
+          ff_v->Groups[ng].Vel_2LPT_prev[0]   = ff_v->Frag[iz].Vel_2LPT_prev[0];
+          ff_v->Groups[ng].Vel_2LPT_prev[1]   = ff_v->Frag[iz].Vel_2LPT_prev[1];
+          ff_v->Groups[ng].Vel_2LPT_prev[2]   = ff_v->Frag[iz].Vel_2LPT_prev[2];
+#ifdef THREE_LPT
+          ff_v->Groups[ng].Vel_3LPT_1_prev[0] = ff_v->Frag[iz].Vel_3LPT_1_prev[0];
+          ff_v->Groups[ng].Vel_3LPT_1_prev[1] = ff_v->Frag[iz].Vel_3LPT_1_prev[1];
+          ff_v->Groups[ng].Vel_3LPT_1_prev[2] = ff_v->Frag[iz].Vel_3LPT_1_prev[2];
+          ff_v->Groups[ng].Vel_3LPT_2_prev[0] = ff_v->Frag[iz].Vel_3LPT_2_prev[0];
+          ff_v->Groups[ng].Vel_3LPT_2_prev[1] = ff_v->Frag[iz].Vel_3LPT_2_prev[1];
+          ff_v->Groups[ng].Vel_3LPT_2_prev[2] = ff_v->Frag[iz].Vel_3LPT_2_prev[2];
+#endif
+#endif
+#endif
+          ff_v->Groups[ng].Mass     = 1;
+          ff_v->Groups[ng].name     = particle_name;
+          ff_v->Groups[ng].point    = iz;
+          ff_v->Groups[ng].bottom   = iz;
+          ff_v->Groups[ng].ll       = ng;
+          ff_v->Groups[ng].halo_app = ng;
+          ff_v->Group_ID[iz]        = ng;
+          ff_v->Linking_list[iz]    = iz;
+
+          if (params.MinHaloMass == 1)
+            {
+              ff_v->Groups[ng].t_appear = ff_v->Frag[iz].Fmax;
+#ifdef SNAPSHOT
+              ff_v->Frag[iz].zacc = ff_v->Frag[iz].Fmax - 1.0;
+#endif
+            }
+          else
+            ff_v->Groups[ng].t_appear = -1;
+
+          ff_v->Ngroups++;
+        }
+      else if (neigrp == 1)
+        {
+          /* CASE 2: 1 neighbouring group */
+          condition_for_accretion_v(1, ibox, jbox, kbox, iz,
+                                    ff_v->Frag[iz].Fmax, neigh[0], &d2, &r2);
+          if (d2 < r2)
+            {
+              accrflag = 1;
+              to_group = neigh[0];
+              accretion_v(to_group, ibox, jbox, kbox, iz, ff_v->Frag[iz].Fmax);
+            }
+          else
+            {
+              ff_v->Groups[FILAMENT].Mass++;
+              ff_v->Group_ID[iz]    = FILAMENT;
+              ff_v->Linking_list[iz] = iz;
+            }
+        }
+      else if (neigrp > 1)
+        {
+          /* CASE 3: more than 1 neighbouring group */
+          best_ratio = pow(10.0 * ff_v->GridSize[0], 2.0);
+          accgrp     = -1;
+          for (ig1 = 0; ig1 < neigrp; ig1++)
+            {
+              condition_for_accretion_v(2, ibox, jbox, kbox, iz,
+                                        ff_v->Frag[iz].Fmax, neigh[ig1],
+                                        &d2, &r2);
+              ratio = d2 / r2;
+              if (ratio < 1.0 && ratio < best_ratio)
+                {
+                  best_ratio = ratio;
+                  accgrp     = ig1;
+                }
+            }
+          if (accgrp >= 0)
+            {
+              accrflag = 1;
+              to_group = neigh[accgrp];
+              accretion_v(neigh[accgrp], ibox, jbox, kbox, iz,
+                          ff_v->Frag[iz].Fmax);
+            }
+
+          /* Check for pairwise merging */
+          nmerge = 0;
+          for (ig1 = 0; ig1 < neigrp; ig1++)
+            for (ig2 = 0; ig2 < ig1; ig2++)
+              {
+                merge_arr[ig1][ig2] = 0;
+                condition_for_merging_v(ff_v->Frag[iz].Fmax,
+                                        neigh[ig1], neigh[ig2], &merge_flag);
+                if (merge_flag)
+                  {
+                    merge_arr[ig1][ig2] = 1;
+                    nmerge++;
+                  }
+              }
+
+          if (nmerge > 0)
+            {
+              for (ig1 = 0; ig1 < neigrp; ig1++)
+                for (ig2 = 0; ig2 < ig1; ig2++)
+                  if (merge_arr[ig1][ig2] == 1 && neigh[ig1] != neigh[ig2])
+                    {
+                      if (ff_v->Groups[neigh[ig1]].Mass >
+                          ff_v->Groups[neigh[ig2]].Mass)
+                        {
+                          merge_groups_v(neigh[ig1], neigh[ig2],
+                                         ff_v->Frag[iz].Fmax);
+                          large = neigh[ig1]; small = neigh[ig2];
+                        }
+                      else
+                        {
+                          merge_groups_v(neigh[ig2], neigh[ig1],
+                                         ff_v->Frag[iz].Fmax);
+                          small = neigh[ig1]; large = neigh[ig2];
+                        }
+                      if (to_group == small) to_group = large;
+                      for (ig3 = 0; ig3 < neigrp; ig3++)
+                        if (neigh[ig3] == small) neigh[ig3] = large;
+                    }
+            }
+
+          /* Re-try accretion if not yet accreted */
+          if (accgrp == -1)
+            {
+              clean_list(neigh);
+              for (nn = neigrp = 0; nn < NV; nn++)
+                if (neigh[nn] > FILAMENT) neigrp++;
+
+              best_ratio = pow(10.0 * ff_v->GridSize[0], 2.0);
+              accgrp     = -1;
+              for (ig1 = 0; ig1 < neigrp; ig1++)
+                {
+                  condition_for_accretion_v(3, ibox, jbox, kbox, iz,
+                                            ff_v->Frag[iz].Fmax, neigh[ig1],
+                                            &d2, &r2);
+                  ratio = d2 / r2;
+                  if (ratio < best_ratio)
+                    {
+                      best_ratio = ratio;
+                      accgrp     = ig1;
+                    }
+                }
+              if (best_ratio < 1.0)
+                {
+                  accrflag = 1;
+                  to_group = neigh[accgrp];
+                  accretion_v(neigh[accgrp], ibox, jbox, kbox, iz,
+                              ff_v->Frag[iz].Fmax);
+                }
+              else
+                {
+                  ff_v->Groups[FILAMENT].Mass++;
+                  ff_v->Group_ID[iz]     = FILAMENT;
+                  ff_v->Linking_list[iz] = iz;
+                }
+            }
+        }
+      else
+        {
+          /* CASE 4: No neighbours — filament */
+          ff_v->Groups[FILAMENT].Mass++;
+          ff_v->Group_ID[iz]     = FILAMENT;
+          ff_v->Linking_list[iz] = iz;
+        }
+
+      /* Accrete neighbouring filament particles if the main particle was accreted */
+      if (accrflag && nf && !skip)
+        {
+          for (ifil = 0; ifil < nf; ifil++)
+            {
+              condition_for_accretion_v(4,
+                                        fil_list[ifil][0], fil_list[ifil][1],
+                                        fil_list[ifil][2], fil_list[ifil][3],
+                                        ff_v->Frag[iz].Fmax, to_group, &d2, &r2);
+              if (d2 < r2) fil_list[ifil][3] *= -1;
+            }
+          for (ifil = 0; ifil < nf; ifil++)
+            if (fil_list[ifil][3] < 0)
+              {
+                fil_list[ifil][3] *= -1;
+                accretion_v(to_group,
+                            fil_list[ifil][0], fil_list[ifil][1],
+                            fil_list[ifil][2], fil_list[ifil][3],
+                            ff_v->Frag[iz].Fmax);
+                ff_v->Groups[FILAMENT].Mass--;
+              }
+        }
+
+    } /* end main loop over collapsed particles */
+
+  ff_v = NULL;   /* clear volume pointer */
+  return 0;
+}
+
+#endif /* USE_FASTFRAG */

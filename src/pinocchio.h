@@ -492,6 +492,25 @@ typedef struct
 } ScaleDep_data;
 extern ScaleDep_data ScaleDep;
 
+#ifdef USE_FASTFRAG
+/**
+ * @brief Subvolume data for FastFrag 8-pass fragmentation.
+ *
+ * Describes a sub-cube of the MPI subbox that is processed independently
+ * during each of the 8 tiling passes.  All arrays (Frag, Group_ID,
+ * Linking_list, Groups) are slices of a single pre-allocated buffer so
+ * that repeated volume initialisation requires only a memset, not malloc.
+ */
+typedef struct
+{
+  unsigned int Npeaks, Ngroups, Npart;
+  int GridSize[3], Start[3];
+  product_data *Frag;
+  group_data   *Groups;
+  int          *Group_ID, *Linking_list;
+} volume_data;
+#endif /* USE_FASTFRAG */
+
 /* prototypes for functions defined in collapse_times.c */
 int compute_collapse_times(int);
 #ifdef TABULATED_CT
@@ -608,11 +627,21 @@ int get_map_bit_coord(int, int, int);
 void set_mapup_bit(int, int, int);
 int estimate_file_size(void);
 double compute_Nhalos_in_PLC(double, double);
+#ifdef USE_FASTFRAG
+int initialize_volume(int, int, int, int, int, int, volume_data *, char *, size_t);
+int merge_catalogs(volume_data *);
+int find_all_peaks(void);
+int count_peaks_v(volume_data *);
+int fragment_fastfrag(void);
+#endif /* USE_FASTFRAG */
 
 /* prototypes for functions defined in build_groups.c */
 int build_groups(int,double,int);
 int quick_build_groups(int);
 int update_map(unsigned int *);
+#ifdef USE_FASTFRAG
+int build_groups_in_volume(volume_data *);
+#endif /* USE_FASTFRAG */
 
 /* GFLUT and pre-computation prototypes (build_groups.c) */
 void gflut_init(double, double);

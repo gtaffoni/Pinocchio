@@ -87,6 +87,12 @@ OPTIONS += -DNORADIATION
 
 ########## Preprocessor Definitions end ########## 
 
+# FastFrag subvolume fragmentation (serial, 8-pass tiling) #
+
+ifdef USE_FASTFRAG
+OPTIONS += -DUSE_FASTFRAG
+endif
+
 # OpenMP Configuration #
 
 ifeq ($(OMP), YES)
