@@ -74,6 +74,7 @@ void set_weight(pos_data *);
 #define LS   (TILE_SIZE + 2)        /* buffer side length: 10 for TILE_SIZE=8  */
 #define LS2  (LS * LS)              /* 100                                     */
 #define LS3  (LS * LS * LS)         /* 1000                                    */
+#define TILE_SIZE3 (TILE_SIZE * TILE_SIZE * TILE_SIZE) /* 512 for TILE_SIZE=8  */
 /* Index into the local buffer for local coords (li,lj,lk) ∈ [0,LS)          */
 #define LIDX(li,lj,lk) ((li)*LS2 + (lj)*LS + (lk))
 
@@ -82,12 +83,44 @@ typedef struct {
   int  n;          /* number of particles in this tile             */
 } tile_t;
 
+/**
+ * @brief Per-thread volume buffer for tile processing (Fase A cache).
+ *
+ * Holds:
+ *  - Frag[]:       Cached product_data for all TILE_SIZE3 tile particles.
+ *                  Eliminates DRAM accesses to frag[iz].Vel at peak creation
+ *                  and provides frag[iz].Fmax from L2 cache.
+ *  - LocalGroups[]: Cached group_data for groups created inside this tile.
+ *                  set_obj/set_group route through get_group_ptr() which
+ *                  returns a pointer here for local groups, avoiding DRAM
+ *                  round-trips on every accretion/merge update.
+ *  - local_gids[]: Global group IDs for each LocalGroups entry.
+ *  - n_local:      Number of active local groups (typically < 50 per tile).
+ *  - pos_cache[]:  Cached frag_pos[] values for tile particles (replaces
+ *                  the Phase-2b stack array tl_self_pos).
+ */
+typedef struct {
+    product_data *Frag;                       /* heap, ALIGN-aligned [TILE_SIZE3]  */
+    group_data   *LocalGroups;                /* heap [TILE_SIZE3 + 2]             */
+    int           local_gids[TILE_SIZE3 + 2]; /* global gid → local slot mapping   */
+    int           n_local;                    /* slots used in LocalGroups          */
+    int           pos_cache[TILE_SIZE3];      /* frag_pos[] cache for tile particles*/
+} tile_vol_t;
+
 /* Tile infrastructure: module-level statics, valid between tile_build and tile_free */
-static tile_t  *tiles_g        = NULL;
-static int      n_tiles_g      = 0;
-static int      NT_g[3]        = {0,0,0};
-static int     *color_list_g[8];
-static int      color_cnt_g[8];
+static tile_t    *tiles_g        = NULL;
+static int        n_tiles_g      = 0;
+static int        NT_g[3]        = {0,0,0};
+static int       *color_list_g[8];
+static int        color_cnt_g[8];
+
+/* Per-thread volume buffers: allocated once per thread in tile_build() */
+static tile_vol_t *tile_vols_g   = NULL;
+
+/* Thread-private pointer to the current thread's volume buffer.
+   Set at the start of each tile, cleared at the end. */
+static tile_vol_t *cur_tv_g      = NULL;
+#pragma omp threadprivate(cur_tv_g)
 
 /**
  * @brief Build per-tile particle lists and 8-color index arrays.
@@ -181,6 +214,34 @@ static void tile_build(int from_z, int to_z, int T)
       color = (tx%2) | ((ty%2)<<1) | ((tz%2)<<2);
       color_list_g[color][color_cnt_g[color]++] = tid;
     }
+
+  /* Allocate per-thread volume buffers (Fase A) */
+  {
+    int t, nthreads = omp_get_max_threads();
+    tile_vols_g = (tile_vol_t *)calloc(nthreads, sizeof(tile_vol_t));
+    if (!tile_vols_g)
+      {
+        fprintf(stderr, "tile_build: out of memory for tile_vols_g\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+    for (t = 0; t < nthreads; t++)
+      {
+        tile_vol_t *tv = &tile_vols_g[t];
+        if (posix_memalign((void**)&tv->Frag, ALIGN,
+                            TILE_SIZE3 * sizeof(product_data)) != 0)
+          {
+            fprintf(stderr, "tile_build: posix_memalign failed for Frag[%d]\n", t);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+          }
+        tv->LocalGroups = (group_data *)malloc((TILE_SIZE3 + 2) * sizeof(group_data));
+        if (!tv->LocalGroups)
+          {
+            fprintf(stderr, "tile_build: out of memory for LocalGroups[%d]\n", t);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+          }
+        tv->n_local = 0;
+      }
+  }
 }
 
 /**
@@ -202,6 +263,19 @@ static void tile_free(void)
       color_list_g[color] = NULL;
     }
   n_tiles_g = 0;
+
+  /* Free per-thread volume buffers (Fase A) */
+  if (tile_vols_g)
+    {
+      int t, nthreads = omp_get_max_threads();
+      for (t = 0; t < nthreads; t++)
+        {
+          free(tile_vols_g[t].Frag);
+          free(tile_vols_g[t].LocalGroups);
+        }
+      free(tile_vols_g);
+      tile_vols_g = NULL;
+    }
 }
 
 /**
@@ -284,7 +358,117 @@ static inline void fill_local_buffer(
         }
     }
 }
+
+/* ----------------------------------------------------------------
+   Fase A helpers: tile_vol_init, tile_vol_flush
+   (get_group_ptr is defined after #endif _OPENMP — must be visible to
+    set_obj / set_group which are compiled unconditionally)
+   ---------------------------------------------------------------- */
+
+/**
+ * @brief Pre-load per-tile caches into the volume buffer.
+ *
+ * Copies the complete product_data and frag_pos entry for every particle
+ * in @p tile into the thread-local @p tv buffer.  This single streaming
+ * pass replaces the separate Phase-2 (Fmax) and Phase-2b (frag_pos)
+ * pre-load loops and adds Vel caching at no extra cost.
+ *
+ * Resets the local group list (n_local = 0) for this tile.
+ *
+ * @param tv    Destination volume buffer (current thread's slot).
+ * @param tile  Tile descriptor (particle list + count).
+ */
+static void tile_vol_init(tile_vol_t *tv, tile_t *tile)
+{
+  int _pi;
+  tv->n_local = 0;
+  for (_pi = 0; _pi < tile->n; _pi++)
+    {
+      int _iz           = tile->particles[_pi];
+      tv->Frag[_pi]     = frag[_iz];       /* full product_data: Fmax + Vel + … */
+      tv->pos_cache[_pi] = frag_pos[_iz];  /* grid-position index for this particle */
+    }
+}
+
+/**
+ * @brief Write back local group Vel/Pos fields to global groups[].
+ *
+ * During tile processing, set_group() updates Vel and Pos only in the
+ * thread-local LocalGroups[] cache (Mass is kept in sync immediately).
+ * This function propagates the final Vel/Pos values back to the global
+ * groups[] array so that post-tile code (output, update_map, etc.)
+ * sees correct data.  Groups merged during this tile (point == -1) are
+ * skipped — their Vel/Pos are no longer meaningful.
+ *
+ * @param tv  Volume buffer whose LocalGroups entries are to be flushed.
+ */
+static void tile_vol_flush(tile_vol_t *tv)
+{
+  int li, k;
+  for (li = 0; li < tv->n_local; li++)
+    {
+      int gid = tv->local_gids[li];
+      if (groups[gid].point < 0)
+        continue;  /* merged away during this tile */
+      group_data *lg = &tv->LocalGroups[li];
+      for (k = 0; k < 3; k++)
+        {
+          groups[gid].Pos[k] = lg->Pos[k];
+          groups[gid].Vel[k] = lg->Vel[k];
+#ifdef TWO_LPT
+          groups[gid].Vel_2LPT[k] = lg->Vel_2LPT[k];
+#ifdef THREE_LPT
+          groups[gid].Vel_3LPT_1[k] = lg->Vel_3LPT_1[k];
+          groups[gid].Vel_3LPT_2[k] = lg->Vel_3LPT_2[k];
+#endif /* THREE_LPT */
+#endif /* TWO_LPT */
+#ifdef RECOMPUTE_DISPLACEMENTS
+          groups[gid].Vel_prev[k] = lg->Vel_prev[k];
+#ifdef TWO_LPT
+          groups[gid].Vel_2LPT_prev[k] = lg->Vel_2LPT_prev[k];
+#ifdef THREE_LPT
+          groups[gid].Vel_3LPT_1_prev[k] = lg->Vel_3LPT_1_prev[k];
+          groups[gid].Vel_3LPT_2_prev[k] = lg->Vel_3LPT_2_prev[k];
+#endif /* THREE_LPT */
+#endif /* TWO_LPT */
+#endif /* RECOMPUTE_DISPLACEMENTS */
+        }
+    }
+}
+
 #endif /* _OPENMP */
+
+/* ----------------------------------------------------------------
+   Fase A: get_group_ptr — always compiled (called from set_obj/set_group)
+   ---------------------------------------------------------------- */
+
+/**
+ * @brief Return a pointer to the group_data for @p global_gid.
+ *
+ * In OpenMP builds, if a tile volume buffer is active for the current thread
+ * AND the group was created inside the current tile, returns a pointer to the
+ * thread-local cached copy in LocalGroups[] (L2 cache).  Otherwise returns
+ * the global groups[] array entry.  The linear scan over n_local (typically
+ * < 50 groups per tile) takes ≈5 ns — negligible vs the DRAM miss avoided.
+ *
+ * In non-OpenMP builds the function always returns &groups[global_gid].
+ *
+ * @param global_gid  Global group ID (index into groups[]).
+ * @return Pointer to the authoritative group_data for that group.
+ */
+static inline group_data *get_group_ptr(int global_gid)
+{
+#ifdef _OPENMP
+  if (cur_tv_g)
+    {
+      int li;
+      for (li = 0; li < cur_tv_g->n_local; li++)
+        if (cur_tv_g->local_gids[li] == global_gid)
+          return &cur_tv_g->LocalGroups[li];
+    }
+#endif
+  return &groups[global_gid];
+}
 
 /* ============================================================
    GFLUT: Growth Factor Lookup Tables
@@ -752,6 +936,9 @@ int build_groups(int Npeaks, double zstop, int first_call)
               /* Local cache buffers: tile + 1-cell shell, fits in L1 (8 KB) */
               int       tl_local_gid [LS3];
               PRODFLOAT tl_local_fmax[LS3];
+              /* Fase A: tl_self_fmax[] and tl_self_pos[] removed — subsumed by
+                 cur_tv_g->Frag[pi].Fmax and cur_tv_g->pos_cache[pi] which are
+                 populated once per tile by tile_vol_init().                      */
               int tile_sx, tile_sy, tile_sz; /* tile start coords for this tile */
               memset(tl_cnt, 0, sizeof(tl_cnt));
               tl_filament_delta = 0;
@@ -774,6 +961,13 @@ int build_groups(int Npeaks, double zstop, int first_call)
                   fill_local_buffer(tile_sx, tile_sy, tile_sz,
                                     tl_local_gid, tl_local_fmax);
 
+                  /* Fase A: unified pre-load — copies full product_data (Fmax,
+                     Vel, Vel_2LPT, …) and frag_pos for all tile particles into
+                     the per-thread volume buffer.  Replaces the previous Phase 2
+                     (Fmax-only) and Phase 2b (frag_pos) separate init loops.    */
+                  cur_tv_g = &tile_vols_g[omp_get_thread_num()];
+                  tile_vol_init(cur_tv_g, tile);
+
                   /* Process particles in this tile in Fmax-descending order */
                   for (tl_pi = 0; tl_pi < tile->n; tl_pi++)
                     {
@@ -785,7 +979,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                       tl_accrflag = 0;
                       for (tl_nn = 0; tl_nn < NV; tl_nn++) tl_neigh[tl_nn] = 0;
 
-                      INDEX_TO_COORD(frag_pos[tl_iz], tl_ibox, tl_jbox, tl_kbox,
+                      INDEX_TO_COORD(cur_tv_g->pos_cache[tl_pi], tl_ibox, tl_jbox, tl_kbox,
                                      subbox.Lgwbl);
 
                       tl_skip = 0;
@@ -886,7 +1080,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                               PRODFLOAT tl_nfmax  = tl_local_fmax[tl_lidx];
                               tl_neigh[tl_nn] = tl_ngid;
                               if (tl_nfmax > (PRODFLOAT)0)
-                                tl_peak_cond &= (frag[tl_iz].Fmax > tl_nfmax);
+                                tl_peak_cond &= (cur_tv_g->Frag[tl_pi].Fmax > tl_nfmax);
 
                               if (tl_ngid == FILAMENT)
                                 {
@@ -919,6 +1113,9 @@ int build_groups(int Npeaks, double zstop, int first_call)
                       /* === CASE 1: PEAK === */
                       if (tl_peak_cond)
                         {
+                          /* Shorthand: Fmax from the L2-resident Frag[] cache */
+                          PRODFLOAT tl_Fmax_pi = cur_tv_g->Frag[tl_pi].Fmax;
+
                           if (good_particle) tl_cnt[0]++;
 
                           /* Lock-free peak allocation via atomic capture.
@@ -933,48 +1130,72 @@ int build_groups(int Npeaks, double zstop, int first_call)
                             }
                           if (par_error) break;
 
-                          /* Init new group — thread has exclusive ownership
-                             of groups[tl_my_group] after critical section   */
-                          groups[tl_my_group].t_peak   = frag[tl_iz].Fmax;
+                          /* Fase A: create a thread-local cached copy of the new
+                             group's data fields (Vel, Pos, Mass).  Subsequent
+                             set_obj/set_group calls for this group will be served
+                             from LocalGroups[] (L2 cache) rather than global
+                             groups[] (DRAM).
+                             Structural fields (point, bottom, ll, …) are written
+                             directly to global groups[] — these are accessed by
+                             accretion/merge_groups via global index, and are only
+                             written once at creation time.                         */
+                          {
+                            int _li = cur_tv_g->n_local++;
+                            cur_tv_g->local_gids[_li] = tl_my_group;
+                            group_data *_lg = &cur_tv_g->LocalGroups[_li];
+
+                            /* Data fields — read from Frag[] (L2, eliminates DRAM) */
+                            _lg->t_peak   = tl_Fmax_pi;
+                            _lg->t_appear = -1;
+                            _lg->t_merge  = -1;
+                            _lg->Pos[0]   = tl_ibox + SHIFT;
+                            _lg->Pos[1]   = tl_jbox + SHIFT;
+                            _lg->Pos[2]   = tl_kbox + SHIFT;
+                            _lg->Vel[0]   = cur_tv_g->Frag[tl_pi].Vel[0];
+                            _lg->Vel[1]   = cur_tv_g->Frag[tl_pi].Vel[1];
+                            _lg->Vel[2]   = cur_tv_g->Frag[tl_pi].Vel[2];
+#ifdef TWO_LPT
+                            _lg->Vel_2LPT[0] = cur_tv_g->Frag[tl_pi].Vel_2LPT[0];
+                            _lg->Vel_2LPT[1] = cur_tv_g->Frag[tl_pi].Vel_2LPT[1];
+                            _lg->Vel_2LPT[2] = cur_tv_g->Frag[tl_pi].Vel_2LPT[2];
+#ifdef THREE_LPT
+                            _lg->Vel_3LPT_1[0] = cur_tv_g->Frag[tl_pi].Vel_3LPT_1[0];
+                            _lg->Vel_3LPT_1[1] = cur_tv_g->Frag[tl_pi].Vel_3LPT_1[1];
+                            _lg->Vel_3LPT_1[2] = cur_tv_g->Frag[tl_pi].Vel_3LPT_1[2];
+                            _lg->Vel_3LPT_2[0] = cur_tv_g->Frag[tl_pi].Vel_3LPT_2[0];
+                            _lg->Vel_3LPT_2[1] = cur_tv_g->Frag[tl_pi].Vel_3LPT_2[1];
+                            _lg->Vel_3LPT_2[2] = cur_tv_g->Frag[tl_pi].Vel_3LPT_2[2];
+#endif /* THREE_LPT */
+#endif /* TWO_LPT */
+#ifdef RECOMPUTE_DISPLACEMENTS
+                            _lg->Vel_prev[0] = cur_tv_g->Frag[tl_pi].Vel_prev[0];
+                            _lg->Vel_prev[1] = cur_tv_g->Frag[tl_pi].Vel_prev[1];
+                            _lg->Vel_prev[2] = cur_tv_g->Frag[tl_pi].Vel_prev[2];
+#ifdef TWO_LPT
+                            _lg->Vel_2LPT_prev[0] = cur_tv_g->Frag[tl_pi].Vel_2LPT_prev[0];
+                            _lg->Vel_2LPT_prev[1] = cur_tv_g->Frag[tl_pi].Vel_2LPT_prev[1];
+                            _lg->Vel_2LPT_prev[2] = cur_tv_g->Frag[tl_pi].Vel_2LPT_prev[2];
+#ifdef THREE_LPT
+                            _lg->Vel_3LPT_1_prev[0] = cur_tv_g->Frag[tl_pi].Vel_3LPT_1_prev[0];
+                            _lg->Vel_3LPT_1_prev[1] = cur_tv_g->Frag[tl_pi].Vel_3LPT_1_prev[1];
+                            _lg->Vel_3LPT_1_prev[2] = cur_tv_g->Frag[tl_pi].Vel_3LPT_1_prev[2];
+                            _lg->Vel_3LPT_2_prev[0] = cur_tv_g->Frag[tl_pi].Vel_3LPT_2_prev[0];
+                            _lg->Vel_3LPT_2_prev[1] = cur_tv_g->Frag[tl_pi].Vel_3LPT_2_prev[1];
+                            _lg->Vel_3LPT_2_prev[2] = cur_tv_g->Frag[tl_pi].Vel_3LPT_2_prev[2];
+#endif /* THREE_LPT */
+#endif /* TWO_LPT */
+#endif /* RECOMPUTE_DISPLACEMENTS */
+                            _lg->Mass = 1;
+                            _lg->name = particle_name;
+                            _lg->good = good_particle;
+                          }
+
+                          /* Structural fields — global groups[] with global indices.
+                             Vel/Pos NOT written here; they live in LocalGroups until
+                             tile_vol_flush() at tile end.                           */
+                          groups[tl_my_group].t_peak   = cur_tv_g->Frag[tl_pi].Fmax;
                           groups[tl_my_group].t_appear = -1;
                           groups[tl_my_group].t_merge  = -1;
-                          groups[tl_my_group].Pos[0] = tl_ibox + SHIFT;
-                          groups[tl_my_group].Pos[1] = tl_jbox + SHIFT;
-                          groups[tl_my_group].Pos[2] = tl_kbox + SHIFT;
-                          groups[tl_my_group].Vel[0] = frag[tl_iz].Vel[0];
-                          groups[tl_my_group].Vel[1] = frag[tl_iz].Vel[1];
-                          groups[tl_my_group].Vel[2] = frag[tl_iz].Vel[2];
-#ifdef TWO_LPT
-                          groups[tl_my_group].Vel_2LPT[0] = frag[tl_iz].Vel_2LPT[0];
-                          groups[tl_my_group].Vel_2LPT[1] = frag[tl_iz].Vel_2LPT[1];
-                          groups[tl_my_group].Vel_2LPT[2] = frag[tl_iz].Vel_2LPT[2];
-#ifdef THREE_LPT
-                          groups[tl_my_group].Vel_3LPT_1[0] = frag[tl_iz].Vel_3LPT_1[0];
-                          groups[tl_my_group].Vel_3LPT_1[1] = frag[tl_iz].Vel_3LPT_1[1];
-                          groups[tl_my_group].Vel_3LPT_1[2] = frag[tl_iz].Vel_3LPT_1[2];
-                          groups[tl_my_group].Vel_3LPT_2[0] = frag[tl_iz].Vel_3LPT_2[0];
-                          groups[tl_my_group].Vel_3LPT_2[1] = frag[tl_iz].Vel_3LPT_2[1];
-                          groups[tl_my_group].Vel_3LPT_2[2] = frag[tl_iz].Vel_3LPT_2[2];
-#endif
-#endif
-#ifdef RECOMPUTE_DISPLACEMENTS
-                          groups[tl_my_group].Vel_prev[0] = frag[tl_iz].Vel_prev[0];
-                          groups[tl_my_group].Vel_prev[1] = frag[tl_iz].Vel_prev[1];
-                          groups[tl_my_group].Vel_prev[2] = frag[tl_iz].Vel_prev[2];
-#ifdef TWO_LPT
-                          groups[tl_my_group].Vel_2LPT_prev[0] = frag[tl_iz].Vel_2LPT_prev[0];
-                          groups[tl_my_group].Vel_2LPT_prev[1] = frag[tl_iz].Vel_2LPT_prev[1];
-                          groups[tl_my_group].Vel_2LPT_prev[2] = frag[tl_iz].Vel_2LPT_prev[2];
-#ifdef THREE_LPT
-                          groups[tl_my_group].Vel_3LPT_1_prev[0] = frag[tl_iz].Vel_3LPT_1_prev[0];
-                          groups[tl_my_group].Vel_3LPT_1_prev[1] = frag[tl_iz].Vel_3LPT_1_prev[1];
-                          groups[tl_my_group].Vel_3LPT_1_prev[2] = frag[tl_iz].Vel_3LPT_1_prev[2];
-                          groups[tl_my_group].Vel_3LPT_2_prev[0] = frag[tl_iz].Vel_3LPT_2_prev[0];
-                          groups[tl_my_group].Vel_3LPT_2_prev[1] = frag[tl_iz].Vel_3LPT_2_prev[1];
-                          groups[tl_my_group].Vel_3LPT_2_prev[2] = frag[tl_iz].Vel_3LPT_2_prev[2];
-#endif
-#endif
-#endif
                           groups[tl_my_group].Mass     = 1;
                           groups[tl_my_group].name     = particle_name;
                           groups[tl_my_group].good     = good_particle;
@@ -983,19 +1204,22 @@ int build_groups(int Npeaks, double zstop, int first_call)
                           groups[tl_my_group].ll       = tl_my_group;
                           groups[tl_my_group].halo_app = tl_my_group;
 #ifdef PLC
-                          if (frag[tl_iz].Fmax > plc.Fstart)
+                          if (tl_Fmax_pi > plc.Fstart)
                             groups[tl_my_group].Flast = plc.Fstart;
                           else
-                            groups[tl_my_group].Flast = frag[tl_iz].Fmax;
+                            groups[tl_my_group].Flast = tl_Fmax_pi;
 #endif
                           group_ID[tl_iz]     = tl_my_group;
                           linking_list[tl_iz] = tl_iz;
 
                           if (params.MinHaloMass == 1)
                             {
-                              groups[tl_my_group].t_appear = frag[tl_iz].Fmax;
+                              groups[tl_my_group].t_appear = tl_Fmax_pi;
+                              /* keep LocalGroups in sync */
+                              cur_tv_g->LocalGroups[cur_tv_g->n_local - 1].t_appear = tl_Fmax_pi;
 #ifdef SNAPSHOT
-                              frag[tl_iz].zacc = frag[tl_iz].Fmax - 1;
+                              /* zacc is written to global frag[]; Fmax read from Frag[] */
+                              frag[tl_iz].zacc = tl_Fmax_pi - 1;
 #endif
                             }
                         }
@@ -1004,7 +1228,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                       else if (tl_neigrp == 1)
                         {
                           condition_for_accretion(1, tl_ibox, tl_jbox, tl_kbox,
-                                                  tl_iz, frag[tl_iz].Fmax,
+                                                  tl_iz, cur_tv_g->Frag[tl_pi].Fmax,
                                                   tl_neigh[0], &tl_d2, &tl_r2);
                           if (tl_d2 < tl_r2)
                             {
@@ -1012,7 +1236,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                               tl_accrflag  = 1;
                               tl_to_group  = tl_neigh[0];
                               accretion(tl_to_group, tl_ibox, tl_jbox, tl_kbox,
-                                        tl_iz, frag[tl_iz].Fmax);
+                                        tl_iz, cur_tv_g->Frag[tl_pi].Fmax);
                             }
                           else
                             {
@@ -1032,7 +1256,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                           for (tl_ig1 = 0; tl_ig1 < tl_neigrp; tl_ig1++)
                             {
                               condition_for_accretion(2, tl_ibox, tl_jbox, tl_kbox,
-                                                      tl_iz, frag[tl_iz].Fmax,
+                                                      tl_iz, cur_tv_g->Frag[tl_pi].Fmax,
                                                       tl_neigh[tl_ig1],
                                                       &tl_d2, &tl_r2);
                               tl_ratio = tl_d2 / tl_r2;
@@ -1054,7 +1278,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                               tl_to_group = tl_neigh[tl_accgrp];
                               accretion(tl_neigh[tl_accgrp],
                                         tl_ibox, tl_jbox, tl_kbox,
-                                        tl_iz, frag[tl_iz].Fmax);
+                                        tl_iz, cur_tv_g->Frag[tl_pi].Fmax);
                             }
 
                           /* Check pairwise merging */
@@ -1063,7 +1287,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                             for (tl_ig2 = 0; tl_ig2 < tl_ig1; tl_ig2++)
                               {
                                 tl_merge_arr[tl_ig1][tl_ig2] = 0;
-                                condition_for_merging(frag[tl_iz].Fmax,
+                                condition_for_merging(cur_tv_g->Frag[tl_pi].Fmax,
                                                       tl_neigh[tl_ig1],
                                                       tl_neigh[tl_ig2],
                                                       &tl_merge_flag);
@@ -1087,7 +1311,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                         {
                                           merge_groups(tl_neigh[tl_ig1],
                                                        tl_neigh[tl_ig2],
-                                                       frag[tl_iz].Fmax);
+                                                       cur_tv_g->Frag[tl_pi].Fmax);
                                           tl_large = tl_neigh[tl_ig1];
                                           tl_small = tl_neigh[tl_ig2];
                                         }
@@ -1095,7 +1319,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                         {
                                           merge_groups(tl_neigh[tl_ig2],
                                                        tl_neigh[tl_ig1],
-                                                       frag[tl_iz].Fmax);
+                                                       cur_tv_g->Frag[tl_pi].Fmax);
                                           tl_small = tl_neigh[tl_ig1];
                                           tl_large = tl_neigh[tl_ig2];
                                         }
@@ -1132,7 +1356,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                 {
                                   condition_for_accretion(3, tl_ibox, tl_jbox,
                                                           tl_kbox, tl_iz,
-                                                          frag[tl_iz].Fmax,
+                                                          cur_tv_g->Frag[tl_pi].Fmax,
                                                           tl_neigh[tl_ig1],
                                                           &tl_d2, &tl_r2);
                                   tl_ratio = tl_d2 / tl_r2;
@@ -1154,7 +1378,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                   tl_to_group = tl_neigh[tl_accgrp];
                                   accretion(tl_neigh[tl_accgrp],
                                             tl_ibox, tl_jbox, tl_kbox,
-                                            tl_iz, frag[tl_iz].Fmax);
+                                            tl_iz, cur_tv_g->Frag[tl_pi].Fmax);
                                 }
                               else
                                 {
@@ -1186,7 +1410,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                 tl_fil_list[tl_ifil][1],
                                 tl_fil_list[tl_ifil][2],
                                 tl_fil_list[tl_ifil][3],
-                                frag[tl_iz].Fmax, tl_to_group,
+                                cur_tv_g->Frag[tl_pi].Fmax, tl_to_group,
                                 &tl_d2, &tl_r2);
                               if (tl_d2 < tl_r2)
                                 tl_fil_list[tl_ifil][3] *= -1; /* tag */
@@ -1201,7 +1425,7 @@ int build_groups(int Npeaks, double zstop, int first_call)
                                           tl_fil_list[tl_ifil][1],
                                           tl_fil_list[tl_ifil][2],
                                           tl_fil_list[tl_ifil][3],
-                                          frag[tl_iz].Fmax);
+                                          cur_tv_g->Frag[tl_pi].Fmax);
                                 /* Update local buffer: filament particle now belongs to tl_to_group */
                                 {
                                   int tl_fli = tl_fil_list[tl_ifil][0] - (tile_sx - 1);
@@ -1237,6 +1461,12 @@ int build_groups(int Npeaks, double zstop, int first_call)
                         group_ID[tl_iz];
 
                     } /* end particle loop within tile */
+
+                  /* Fase A: flush LocalGroups Vel/Pos back to global groups[] and
+                     clear the per-thread pointer for safety.                     */
+                  tile_vol_flush(cur_tv_g);
+                  cur_tv_g = NULL;
+
                 } /* end omp for over tiles */
 
               /* Flush thread-local FILAMENT.Mass delta — one atomic per thread
@@ -2753,11 +2983,15 @@ void set_obj(int grp,PRODFLOAT F,pos_data *myobj)
 {
   /* sets all the quantities needed to handle a group */
 
-  myobj->M=groups[grp].Mass;
+  /* Fase A: route through local cache when inside a tile (get_group_ptr
+     returns &LocalGroups[li] for local groups, &groups[grp] otherwise). */
+  group_data *g = get_group_ptr(grp);
+
+  myobj->M=g->Mass;
   myobj->z=F-1.0;
 
 #ifdef SCALE_DEPENDENT
-  /* Group velocities are averaged over group particles, so their growth  
+  /* Group velocities are averaged over group particles, so their growth
      should be computed on a different scale */
 
   /* Lagrangian radius of the object */
@@ -2777,26 +3011,26 @@ void set_obj(int grp,PRODFLOAT F,pos_data *myobj)
 
   set_weight(myobj);
 
-  myobj->M=groups[grp].Mass;
+  myobj->M=g->Mass;
   for (int i=0;i<3;i++)
     {
-      myobj->q[i]=groups[grp].Pos[i];
-      myobj->v[i]=groups[grp].Vel[i];
+      myobj->q[i]=g->Pos[i];
+      myobj->v[i]=g->Vel[i];
 #ifdef TWO_LPT
-      myobj->v2[i]=groups[grp].Vel_2LPT[i];
+      myobj->v2[i]=g->Vel_2LPT[i];
 #ifdef THREE_LPT
-      myobj->v31[i]=groups[grp].Vel_3LPT_1[i];
-      myobj->v32[i]=groups[grp].Vel_3LPT_2[i];
+      myobj->v31[i]=g->Vel_3LPT_1[i];
+      myobj->v32[i]=g->Vel_3LPT_2[i];
 #endif
 #endif
 
 #ifdef RECOMPUTE_DISPLACEMENTS
-      myobj->v_prev[i]=groups[grp].Vel_prev[i];
+      myobj->v_prev[i]=g->Vel_prev[i];
 #ifdef TWO_LPT
-      myobj->v2_prev[i]=groups[grp].Vel_2LPT_prev[i];
+      myobj->v2_prev[i]=g->Vel_2LPT_prev[i];
 #ifdef THREE_LPT
-      myobj->v31_prev[i]=groups[grp].Vel_3LPT_1_prev[i];
-      myobj->v32_prev[i]=groups[grp].Vel_3LPT_2_prev[i];
+      myobj->v31_prev[i]=g->Vel_3LPT_1_prev[i];
+      myobj->v32_prev[i]=g->Vel_3LPT_2_prev[i];
 #endif
 #endif
 #endif
@@ -2922,26 +3156,36 @@ void set_group(int grp,pos_data *myobj)
 {
   /* copies relevant information from an object to a group data */
 
-  groups[grp].Mass=myobj->M;
+  /* Fase A: route through local cache when inside a tile.  Mass is also
+     written back to the global groups[] entry immediately so that callers
+     of accretion/merge_groups that read groups[grp].Mass directly (e.g.
+     condition_for_accretion, condition_for_merging) always see the
+     up-to-date value without waiting for tile_vol_flush().              */
+  group_data *g = get_group_ptr(grp);
+
+  g->Mass=myobj->M;
+  if (g != &groups[grp])
+    groups[grp].Mass = myobj->M;   /* keep global Mass in sync */
+
   for (int i=0;i<3;i++)
     {
-      groups[grp].Pos[i]=myobj->q[i];
-      groups[grp].Vel[i]=myobj->v[i];
+      g->Pos[i]=myobj->q[i];
+      g->Vel[i]=myobj->v[i];
 #ifdef TWO_LPT
-      groups[grp].Vel_2LPT[i]=myobj->v2[i];
+      g->Vel_2LPT[i]=myobj->v2[i];
 #ifdef THREE_LPT
-      groups[grp].Vel_3LPT_1[i]=myobj->v31[i];
-      groups[grp].Vel_3LPT_2[i]=myobj->v32[i];
+      g->Vel_3LPT_1[i]=myobj->v31[i];
+      g->Vel_3LPT_2[i]=myobj->v32[i];
 #endif
 #endif
 
 #ifdef RECOMPUTE_DISPLACEMENTS
-      groups[grp].Vel_prev[i]=myobj->v_prev[i];
+      g->Vel_prev[i]=myobj->v_prev[i];
 #ifdef TWO_LPT
-      groups[grp].Vel_2LPT_prev[i]=myobj->v2_prev[i];
+      g->Vel_2LPT_prev[i]=myobj->v2_prev[i];
 #ifdef THREE_LPT
-      groups[grp].Vel_3LPT_1_prev[i]=myobj->v31_prev[i];
-      groups[grp].Vel_3LPT_2_prev[i]=myobj->v32_prev[i];
+      g->Vel_3LPT_1_prev[i]=myobj->v31_prev[i];
+      g->Vel_3LPT_2_prev[i]=myobj->v32_prev[i];
 #endif
 #endif
 #endif
