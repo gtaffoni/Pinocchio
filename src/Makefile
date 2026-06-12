@@ -358,7 +358,8 @@ endif
 OBJECTS = fmax.o variables.o  cubic_spline_interpolation.o cubic_spline_interpolation_full_GPU.o \
           initialization.o collapse_times.o collapse_times_GPU.o fmax-heffte.o GenIC.o \
 	      ReadParamfile.o allocations.o LPT.o distribute.o \
-	      fragment.o build_groups.o write_halos.o write_snapshot.o write_mass_maps.o cosmo.o 
+	      fragment.o build_groups.o write_halos.o write_snapshot.o write_mass_maps.o cosmo.o \
+	      parallel_sort.o
 
 ifeq ($(ENERGY), YES)
 OBJECTS += energy_pmt_methods.o

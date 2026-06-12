@@ -116,7 +116,7 @@
 #define SPEEDOFLIGHT ((double)299792.458) /* km/s */
 #define GRAVITY ((double)4.30200e-9)      /*  (M_sun^-1 (km/s)^2 Mpc)  */
 #define NBINS 210     /* number of time bins in cosmological quantities */
-#define FRAGFIELDS 6
+#define FRAGFIELDS 6    /* frag_pos, indices, indicesY, sorted_pos, group_ID, linking_list */
 
 #define NSIGMA ((double)6.0)
 #define STEP_VAR ((double)0.3)  //0.2)   /* this sets the spacing for smoothing radii */

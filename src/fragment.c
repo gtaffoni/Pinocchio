@@ -25,6 +25,7 @@
 */
 
 #include "pinocchio.h"
+#include "parallel_sort.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -361,11 +362,21 @@ int fragment()
     /* sorting of particles according to their collapse time */
     tmp = MPI_Wtime();
     if (!ThisTask)
-      printf("[%s] Starting sorting\n", fdate());
+      printf("[%s] Starting sorting (parallel radix sort)\n", fdate());
 
-    for (int i = 0; i < subbox.Npart; i++)
-      *(indices + i) = i;
-    qsort((void *)indices, subbox.Npart, sizeof(int), index_compare_F);
+    /* Two-pass stable radix sort: exactly equivalent to qsort(index_compare_F).
+       Pass 1 (inside the function): sort indices by frag_pos ascending.
+       Pass 2 (inside the function): sort the pass-1 permutation by Fmax
+         descending, stably, preserving pass-1 order for equal-Fmax elements.
+       Result: Fmax descending, ties broken by frag_pos ascending = index_compare_F.
+       Scratch buffers:
+         buf_indices -> indicesY   (not live before first build_groups)
+         buf_keys    -> (uint*)sorted_pos (not live before sort_and_organize)
+         buf_idx     -> NULL: allocated internally by the sort routine, avoids
+                        counting scratch in FRAGFIELDS/Nalloc budget */
+    parallel_radix_sort_fmax_desc_stable_by_pos(frag, frag_pos, indices, indicesY,
+                                                (unsigned int *)sorted_pos, NULL,
+                                                subbox.Npart);
 
     tmp = MPI_Wtime() - tmp;
     cputime.sort += tmp;
@@ -598,10 +609,22 @@ void sort_and_organize(void)
   if (!ThisTask)
     printf("[%s] Starting sorting\n", fdate());
 
-  /* sort particles in order of descending Fmax */
-  for (i = 0; i < subbox.Nstored; i++)
-    *(indices + i) = i;
-  qsort((void *)indices, subbox.Nstored, sizeof(int), index_compare_F);
+  /* Two-pass stable radix sort: exactly equivalent to qsort(index_compare_F).
+     Pass 1: sort by frag_pos ascending.
+     Pass 2: sort pass-1 permutation by Fmax descending, stably.
+     Result: Fmax descending, ties broken by frag_pos ascending = index_compare_F.
+     This is the correctness requirement for RECOMPUTE_DISPLACEMENTS: repeated
+     calls to sort_and_organize (after redistribute) must produce the EXACT SAME
+     index->particle mapping so that recompute_group_velocities can walk
+     linking_list consistently.
+     Scratch buffers:
+       buf_indices -> indicesY   (populated as inverse permutation immediately after)
+       buf_keys    -> (uint*)sorted_pos (overwritten at the sorted_pos loop below)
+       buf_idx     -> NULL: allocated internally by the sort routine; group_ID and
+                      linking_list are LIVE here so no aliasing is possible or needed */
+  parallel_radix_sort_fmax_desc_stable_by_pos(frag, frag_pos, indices, indicesY,
+                                              (unsigned int *)sorted_pos, NULL,
+                                              subbox.Nstored);
 
   /* this is needed to reorder */
   for (i = 0; i < subbox.Nstored; i++)
@@ -610,8 +633,17 @@ void sort_and_organize(void)
   /* reorder the frag data structure and frag_pos in order of descending Fmax */
   reorder(indicesY, subbox.Nstored);
 
-  /* sort particles in order of ascending position */
-  qsort((void *)indices, subbox.Nstored, sizeof(int), index_compare_P);
+  /* sort particles in order of ascending position.
+     After reorder(), indicesY[] is the identity permutation (reorder zeroes it),
+     sorted_pos[] contains radix scratch garbage — both safe to reuse.
+     parallel_radix_sort_by_position_asc re-initialises indices to 0..N-1
+     internally, then sorts by ascending frag_pos[i], exactly matching
+     index_compare_P.  Positions are unique grid indices so there are no ties;
+     the sort is exactly equivalent to the qsort it replaces.
+     Scratch: indicesY, (uint*)sorted_pos, buf_idx=NULL (allocated internally). */
+  parallel_radix_sort_by_position_asc(frag_pos, indices, indicesY,
+                                      (unsigned int *)sorted_pos, NULL,
+                                      subbox.Nstored);
   /* create a vector sorted_pos with sorted positions and pointers to it */
   for (i = 0; i < subbox.Nstored; i++)
     sorted_pos[i] = frag_pos[i];
