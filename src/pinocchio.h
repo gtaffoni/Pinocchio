@@ -355,6 +355,10 @@ typedef struct
 #ifdef PLC
   PRODFLOAT Flast;
 #endif
+#ifdef USE_FASTFRAG
+  int aux1; /* volume-local group index → global group index mapping (merge_catalogs) */
+  int aux2; /* distance of halo from volume border in grid units (merge_catalogs)     */
+#endif
 } group_data;
 extern group_data *groups;
 

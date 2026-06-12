@@ -114,6 +114,8 @@ ifeq ($(SYSTYPE),"docker")
 CC          =  mpicc
 CDEBUG      = -ggdb3 -Wall $(OMP_FLAG)
 COPTIMIZED  = -O3 -Wno-unused-result $(OMP_FLAG)
+# docker image has libfftw3_omp but not libfftw3_threads
+OMP_FFTW    = -lfftw3_omp
 FFTW_LIBR   = -L/usr/local/fftw3/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
 FFTW_INCL   = -I/usr/local/fftw3/include
 PFFT_LIBR   = -L/usr/local/pfft/lib -lpfft
@@ -163,20 +165,23 @@ endif
 
 ###################### PLEIADI ######################
 
-ifeq ($(SYSTYPE),"pleiadi")
-CC          =  mpicc
+ifeq ($(SYSTYPE), Pleiadi)
+COMPILER_CC          =  mpicc
+COMPILER_CC++       =  mpic++
+SPACKHOME   =  ${SPACK_ENV}/.spack-env/view/
 CDEBUG      = -g -Wall $(OMP_FLAG)
 COPTIMIZED  = -O3 -Wno-unused-result $(OMP_FLAG)
-FFTW_LIBR   = -L/opt/cluster/spack/opt/spack/linux-centos7-broadwell/gcc-11.2.0/fftw-3.3.10-bap3ootbcmiypnmo7rouk57jbdhfjuty/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
-FFTW_INCL   = -I/opt/cluster/spack/opt/spack/linux-centos7-broadwell/gcc-11.2.0/fftw-3.3.10-bap3ootbcmiypnmo7rouk57jbdhfjuty/include
-PFFT_LIBR   = -L/opt/cluster/spack/opt/spack/linux-centos7-broadwell/gcc-11.2.0/pfft-1.0.8-alpha-qy6lqerctfrhjzaoamzjhbpga2ofejqf/lib -lpfft
-PFFT_INCL   = -I/opt/cluster/spack/opt/spack/linux-centos7-broadwell/gcc-11.2.0/pfft-1.0.8-alpha-qy6lqerctfrhjzaoamzjhbpga2ofejqf/include
-MPI_LIBR    =
-MPI_INCL    =
-GSL_LIBR    = -L/opt/cluster/spack/opt/spack/linux-centos7-broadwell/gcc-11.2.0/gsl-2.7.1-uehbowahpvubxundtx3cz4a4a5sdwzun/lib -lgsl -lgslcblas -lm
-GSL_INCL    = -I/opt/cluster/spack/opt/spack/linux-centos7-broadwell/gcc-11.2.0/gsl-2.7.1-uehbowahpvubxundtx3cz4a4a5sdwzun/include
+FFTW_LIBR   = -L$(SPACKHOME)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
+FFTW_INCL   = -I$(SPACKHOME)/include
+PFFT_LIBR   = -L$(SPACKHOME)/lib -lpfft
+PFFT_INCL   = -I$(SPACKHOME)/include
+MPI_LIBR    = -L$(SPACKHOME)/lib
+MPI_INCL    = -I$(SPACKHOME)/include
+GSL_LIBR    = -L$(SPACKHOME)/lib -lgsl -lgslcblas -lm
+GSL_INCL    = -I$(SPACKHOME)/include
+HEFF_LIBR   = -L$(SPACKHOME)/lib -lheffte
+HEFF_INCL   = -I$(SPACKHOME)/include
 endif
-
 
 ###################### LEONARDO ######################
 ifeq ($(SYSTYPE), "LeonardoBoost")

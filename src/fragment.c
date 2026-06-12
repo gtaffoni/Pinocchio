@@ -1272,21 +1272,38 @@ int initialize_volume(int ic, int jc, int kc,
   off += (size_t)my_volume->Npart * sizeof(int);
   my_volume->Groups       = (group_data *)(buf + off);
 
-  /* Copy frag data from subbox into volume, honouring PBCs */
+  /* Copy frag data from subbox into volume, honouring PBCs.
+   *
+   * After sort_and_organize(), frag[] is in Fmax-descending order:
+   *   frag[i]     = product data of the i-th highest-Fmax particle
+   *   frag_pos[i] = grid position (subbox index) of that particle
+   *   sorted_pos[grid_pos] = time-order index of particle at grid_pos (-1 if absent)
+   *
+   * To get the product data for a particle at subbox grid position posb, use
+   *   sorted_pos[posb] as the index into frag[].
+   * If sorted_pos[posb] == -1 the particle is outside the stored boundary: leave Fmax=0.
+   */
   for (int iv = 0; iv < sizex; iv++)
     {
       int ib = SET_PBC_FF(iv + ic, subbox.pbc[_x_], subbox.Lgwbl[_x_]);
-      for (int jv = 0; jv < sizey; jv++)
-        {
-          int jb = SET_PBC_FF(jv + jc, subbox.pbc[_y_], subbox.Lgwbl[_y_]);
-          for (int kv = 0; kv < sizez; kv++)
+          /* Skip cells that fall outside the subbox (non-PBC edge tasks) */
+          if (ib < 0 || ib >= subbox.Lgwbl[_x_]) continue;
+          for (int jv = 0; jv < sizey; jv++)
             {
-              int kb = SET_PBC_FF(kv + kc, subbox.pbc[_z_], subbox.Lgwbl[_z_]);
-              int posv = COORD_TO_INDEX(iv, jv, kv, my_volume->GridSize);
-              int posb = COORD_TO_INDEX(ib, jb, kb, subbox.Lgwbl);
-              memcpy(my_volume->Frag + posv, frag + posb, sizeof(product_data));
+              int jb = SET_PBC_FF(jv + jc, subbox.pbc[_y_], subbox.Lgwbl[_y_]);
+              if (jb < 0 || jb >= subbox.Lgwbl[_y_]) continue;
+              for (int kv = 0; kv < sizez; kv++)
+                {
+                  int kb = SET_PBC_FF(kv + kc, subbox.pbc[_z_], subbox.Lgwbl[_z_]);
+                  if (kb < 0 || kb >= subbox.Lgwbl[_z_]) continue;
+                  int posv = COORD_TO_INDEX(iv, jv, kv, my_volume->GridSize);
+                  int posb = COORD_TO_INDEX(ib, jb, kb, subbox.Lgwbl);
+                  int ti   = sorted_pos[posb]; /* time-order index, or -1 */
+                  if (ti >= 0)
+                    memcpy(my_volume->Frag + posv, frag + ti, sizeof(product_data));
+                  /* else: particle absent → Frag[posv] stays zeroed (Fmax=0) */
+                }
             }
-        }
     }
 
   my_volume->Npeaks  = (unsigned int)count_peaks_v(my_volume);
@@ -1337,10 +1354,18 @@ int merge_catalogs(volume_data *my_volume)
         }
     }
 
-  /* Sort the global group list in decreasing t_peak order */
-  for (int gi = 0; gi < ngroups; gi++)
-    indices[gi] = gi;
-  qsort((void *)indices, ngroups, sizeof(int), ff_index_compare_F);
+  /* Sort the global group list in decreasing t_peak order.
+   * Cached across calls: ngroups is constant after find_all_peaks() so the
+   * order never changes.  Avoids O(N log N) sort on every merge_catalogs call
+   * (critical for the ultimo loop which calls us ~48K times). */
+  static int ff_sorted_ngroups = -1;
+  if (ngroups != ff_sorted_ngroups)
+    {
+      for (int gi = 0; gi < ngroups; gi++)
+        indices[gi] = gi;
+      qsort((void *)indices, ngroups, sizeof(int), ff_index_compare_F);
+      ff_sorted_ngroups = ngroups;
+    }
 
   /* Match volume group list with global list; both sorted by t_peak */
   int p = 0;
@@ -1430,9 +1455,15 @@ int merge_catalogs(volume_data *my_volume)
               if (pv == my_volume->Groups[gvol].bottom)
                 groups[global].bottom = ps;
 
-              /* Mark particle as processed */
-              group_ID[ps]   = global;
-              frag[ps].Rmax  = -1;
+              /* Mark particle as processed.
+               * group_ID is indexed by subbox grid position (ps).
+               * frag[] is in time-order after sort_and_organize(): use
+               * sorted_pos[ps] to reach the correct frag entry. */
+              group_ID[ps] = global;
+              {
+                int ti = sorted_pos[ps];
+                if (ti >= 0) frag[ti].Rmax = -1;
+              }
 
               int pv_next = my_volume->Linking_list[pv];
               int ps_next = volume2subbox(pv_next, my_volume);
@@ -1477,14 +1508,21 @@ int find_all_peaks(void)
   groups[FILAMENT].Mass = 0;
   ngroups = FILAMENT + 1;
 
+  /* After sort_and_organize(), frag[iz] is sorted by decreasing Fmax.
+   * frag_pos[iz]     = subbox grid index of the iz-th sorted particle.
+   * sorted_pos[grid] = time-order index of particle at grid pos (-1 if absent).
+   * We iterate by time order (can break early when Fmax < Flast),
+   * but use frag_pos[iz] for spatial coordinates and sorted_pos for neighbours. */
+
   for (iz = 0; iz < (int)subbox.Nstored; iz++)
     {
       if (frag[iz].Fmax < outputs.Flast)
-        continue;
+        break; /* array is sorted descending — safe to break */
 
-      INDEX_TO_COORD(iz, i, j, k, subbox.Lgwbl);
+      int grid_iz = frag_pos[iz]; /* subbox grid index of this particle */
+      INDEX_TO_COORD(grid_iz, i, j, k, subbox.Lgwbl);
 
-      /* Skip particles at the subbox border (no PBC wrapping here) */
+      /* Skip particles at the subbox border */
       if (!subbox.pbc[_x_] && (i == 0 || i == subbox.Lgwbl[_x_] - 1)) continue;
       if (!subbox.pbc[_y_] && (j == 0 || j == subbox.Lgwbl[_y_] - 1)) continue;
       if (!subbox.pbc[_z_] && (k == 0 || k == subbox.Lgwbl[_z_] - 1)) continue;
@@ -1518,8 +1556,11 @@ int find_all_peaks(void)
               break;
             default: i1 = i; j1 = j; k1 = k; break;
             }
-          peak_cond &= (frag[iz].Fmax >
-                        frag[COORD_TO_INDEX(i1, j1, k1, subbox.Lgwbl)].Fmax);
+          /* Neighbour lookup: sorted_pos[grid] → time-order index into frag[] */
+          int neigh_grid = COORD_TO_INDEX(i1, j1, k1, subbox.Lgwbl);
+          int neigh_ti   = sorted_pos[neigh_grid]; /* -1 if not stored */
+          PRODFLOAT neigh_fmax = (neigh_ti >= 0) ? frag[neigh_ti].Fmax : (PRODFLOAT)0;
+          peak_cond &= (frag[iz].Fmax > neigh_fmax);
           if (!peak_cond) break;
         }
 
@@ -1546,8 +1587,8 @@ int find_all_peaks(void)
                           MyGrids[0].GSglobal[_z_]),
               MyGrids[0].GSglobal);
           groups[ngroups].good     = 0;
-          groups[ngroups].point    = iz;
-          groups[ngroups].bottom   = iz;
+          groups[ngroups].point    = grid_iz; /* subbox grid index */
+          groups[ngroups].bottom   = grid_iz;
           groups[ngroups].ll       = ngroups;
           groups[ngroups].halo_app = ngroups;
           groups[ngroups].aux2     = 0;
@@ -1609,12 +1650,30 @@ int fragment_fastfrag(void)
       size = subbox.Lgwbl[_x_];
     }
 
-  /* Allocate a single reusable buffer for all subvolume data.
-     Maximum subvolume size is (size+2)^3. */
-  size_t vol_n   = (size_t)(size + 2) * (size + 2) * (size + 2);
-  size_t vol_sz  = vol_n * (sizeof(product_data) + 2 * sizeof(int) +
-                             sizeof(group_data));
-  char *vol_buf  = (char *)malloc(vol_sz);
+  /* Per-dimension Nsub to cover non-cubic subboxes (e.g. 2D MPI decomposition) */
+  int Nsuby = subbox.Lgwbl[_y_] / size; if (Nsuby < 1) Nsuby = 1;
+  int Nsubz = subbox.Lgwbl[_z_] / size; if (Nsubz < 1) Nsubz = 1;
+
+  /* Largest subbox dimension — used to size the "ultimo loop" volumes */
+  int Lgwbl_max = subbox.Lgwbl[_x_];
+  if (subbox.Lgwbl[_y_] > Lgwbl_max) Lgwbl_max = subbox.Lgwbl[_y_];
+  if (subbox.Lgwbl[_z_] > Lgwbl_max) Lgwbl_max = subbox.Lgwbl[_z_];
+  int Lgwbl_min = subbox.Lgwbl[_x_];
+  if (subbox.Lgwbl[_y_] < Lgwbl_min) Lgwbl_min = subbox.Lgwbl[_y_];
+  if (subbox.Lgwbl[_z_] < Lgwbl_min) Lgwbl_min = subbox.Lgwbl[_z_];
+
+  /* Initial "ultimo loop" volume side: centered on the peak, minimum size
+     that guarantees dist(peak, border) = (size_u0-1)/2 > 9 (= A_THR_FF).
+     half-size = 10 > 9 => peak is always "safe" in one pass. */
+  int size_u0 = 21;   /* 2*(9+1)+1 = 21; matches A_THR_FF=9 in merge_catalogs */
+
+  /* Single reusable buffer, sized for max of: 8-pass volume and ultimo initial volume */
+  size_t n_pass   = (size_t)(size + 2) * (size + 2) * (size + 2);
+  size_t n_ultimo = (size_t)size_u0 * size_u0 * size_u0;
+  size_t vol_n    = (n_pass > n_ultimo) ? n_pass : n_ultimo;
+  size_t vol_sz   = vol_n * (sizeof(product_data) + 2 * sizeof(int) +
+                              sizeof(group_data));
+  char  *vol_buf  = (char *)malloc(vol_sz);
   if (!vol_buf)
     {
       printf("ERROR Task %d [fragment_fastfrag]: malloc failed for volume buffer (%zu bytes)\n",
@@ -1624,8 +1683,8 @@ int fragment_fastfrag(void)
     }
 
   if (!ThisTask)
-    printf("[%s] FastFrag: Nsub=%d, size=%d, volume buffer %zu MB\n",
-           fdate(), Nsub, size, vol_sz / (1024 * 1024));
+    printf("[%s] FastFrag: Nsub=%d size=%d Nsubyz=%d/%d ultimo_size=%d buf %zu MB\n",
+           fdate(), Nsub, size, Nsuby, Nsubz, size_u0, vol_sz / (1024 * 1024));
 
   /* Pre-identify all peaks in the subbox and initialise groups[] */
   int Npeaks = find_all_peaks();
@@ -1638,16 +1697,16 @@ int fragment_fastfrag(void)
   if (!ThisTask)
     printf("[%s] FastFrag: found %d peaks in subbox\n", fdate(), Npeaks);
 
-  /* 8-pass loop */
+  /* 8-pass loop — use per-dimension Nsub to cover non-cubic subboxes */
   for (int pass = 0; pass < 8; pass++)
     {
       int ox = pass_offsets[pass][0] * (size / 2);
       int oy = pass_offsets[pass][1] * (size / 2);
       int oz = pass_offsets[pass][2] * (size / 2);
 
-      for (int is = 0; is < Nsub; is++)
-        for (int js = 0; js < Nsub; js++)
-          for (int ks = 0; ks < Nsub; ks++)
+      for (int is = 0; is < Nsub;  is++)
+        for (int js = 0; js < Nsuby; js++)
+          for (int ks = 0; ks < Nsubz; ks++)
             {
               volume_data my_volume;
 
@@ -1680,7 +1739,144 @@ int fragment_fastfrag(void)
         printf("[%s] FastFrag: pass %d/%d done\n", fdate(), pass + 1, 8);
     }
 
+  /* ------------------------------------------------------------------
+   * Ultimo loop: resolve halos that were never safely interior to
+   * any of the 8-pass volumes (i.e. groups with good==0 after all passes).
+   * For each such halo, build a volume centred on its peak and process it.
+   * Analogous to the "ultimo loop" in src_fastfrag/fragment.c.
+   * ------------------------------------------------------------------ */
+  {
+    int n_resolved = 0;
+
+    for (int g = FILAMENT + 1; g < ngroups; g++)
+      {
+        if (groups[g].good)            continue;   /* already done   */
+        if (groups[g].Mass <= 1)       continue;   /* single-particle, skip */
+        if (groups[g].halo_app != g)   continue;   /* merged branch  */
+
+        int ib, jb, kb;
+        INDEX_TO_COORD(groups[g].point, ib, jb, kb, subbox.Lgwbl);
+
+        int size_u = size_u0;
+
+        do
+          {
+            /* Grow buffer if needed */
+            size_t need_u = (size_t)size_u * size_u * size_u *
+                            (sizeof(product_data) + 2 * sizeof(int) +
+                             sizeof(group_data));
+            if (need_u > vol_sz)
+              {
+                char *new_buf = (char *)realloc(vol_buf, need_u);
+                if (!new_buf)
+                  {
+                    printf("ERROR Task %d [fastfrag ultimo]: realloc failed "
+                           "for %zu bytes\n", ThisTask, need_u);
+                    free(vol_buf);
+                    return 1;
+                  }
+                vol_buf = new_buf;
+                vol_sz  = need_u;
+              }
+
+            volume_data my_volume;
+
+            if (initialize_volume(ib - size_u / 2,
+                                  jb - size_u / 2,
+                                  kb - size_u / 2,
+                                  size_u, size_u, size_u,
+                                  &my_volume, vol_buf, vol_sz))
+              {
+                free(vol_buf);
+                return 1;
+              }
+
+            if (build_groups_in_volume(&my_volume))
+              {
+                free(vol_buf);
+                return 1;
+              }
+
+            if (merge_catalogs(&my_volume))
+              {
+                free(vol_buf);
+                return 1;
+              }
+
+            if (!groups[g].good)
+              size_u = (int)(size_u * 1.2);
+          }
+        while (!groups[g].good && size_u <= Lgwbl_min);
+
+        if (groups[g].good)
+          n_resolved++;
+      }
+
+    if (!ThisTask)
+      printf("[%s] FastFrag: ultimo loop resolved %d additional halos\n",
+             fdate(), n_resolved);
+  }
+
   free(vol_buf);
+
+  /* ------------------------------------------------------------------
+   * Statistics and catalog output
+   * ------------------------------------------------------------------ */
+
+  /* Count good halos across all MPI tasks */
+  {
+    unsigned long long good_halos = 0, all_good_halos = 0;
+    unsigned long long n_peaks    = (unsigned long long)Npeaks;
+    unsigned long long all_peaks  = 0;
+    int ig1;
+
+    for (ig1 = FILAMENT + 1; ig1 <= ngroups; ig1++)
+      if (groups[ig1].point >= 0 && groups[ig1].good)
+        good_halos++;
+
+    MPI_Reduce(&n_peaks,    &all_peaks,      1, MPI_UNSIGNED_LONG_LONG,
+               MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&good_halos, &all_good_halos, 1, MPI_UNSIGNED_LONG_LONG,
+               MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (!ThisTask)
+      {
+        printf("Total number of peaks:                 %llu\n", all_peaks);
+        printf("Total number of good halos:            %llu\n", all_good_halos);
+        printf("\n");
+      }
+  }
+
+  /* Write output catalogs for all requested redshifts */
+  {
+    double cputmp;
+    int iout;
+
+    for (iout = 0; iout < outputs.n; iout++)
+      {
+        cputmp = MPI_Wtime();
+
+        if (!ThisTask)
+          printf("[%s] Writing output at z=%f (FastFrag)\n",
+                 fdate(), outputs.z[iout]);
+
+        fflush(stdout);
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        if (write_catalog(iout))
+          return 1;
+
+        if (compute_mf(iout))
+          return 1;
+
+        if (iout == outputs.n - 1)
+          if (write_histories())
+            return 1;
+
+        cputime.io += MPI_Wtime() - cputmp;
+      }
+  }
+
   return 0;
 }
 
