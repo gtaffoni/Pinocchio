@@ -323,7 +323,74 @@ CFITSIO_LIBR = -L$(CFITSIO_ROOT)/lib -lcfitsio
 
 endif
 
-########## System-specific Configuration end ########## 
+###################### BASE ######################
+
+ifeq ($(SYSTYPE),base)
+CC          =  mpicc
+CDEBUG      = -ggdb3 -Wall $(OMP_FLAG)
+COPTIMIZED  = -O3 -Wno-unused-result $(OMP_FLAG)
+FFTW_LIBR   = -L$(FFTW_LIB) -lfftw3_mpi -lfftw3 $(OMP_FFTW)
+FFTW_INCL   = -I$(HOME)/include
+PFFT_LIBR   = -L$(HOME)/lib -lpfft
+PFFT_INCL   = -I$(HOME)/include
+
+# TODO: set heFFTe path for this machine (needed only when USE_HEFFTE=YES)
+HEFFTE_DIR  = $(HOME)/heffte
+HEFF_LIBR   = -L$(HEFFTE_DIR)/lib -lheffte
+HEFF_INCL   = -I$(HEFFTE_DIR)/include
+
+MPI_LIBR    =
+MPI_INCL    =
+GSL_LIBR    = -L$(HOME)/lib -lgsl -lgslcblas -lm
+GSL_INCL    = -I$(HOME)/include/gsl
+endif
+
+###################### MARCONI100 ######################
+
+ifeq ($(SYSTYPE),Marconi100)
+CC          =  mpicc
+CDEBUG      = -ggdb3 -Wall $(OMP_FLAG)
+COPTIMIZED  = -O2 -Wno-unused-result $(OMP_FLAG)
+FFTW_LIBR   = -L$(HOME)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
+FFTW_INCL   = -I$(HOME)/include
+PFFT_LIBR   = -lpfft
+PFFT_INCL   =
+
+# TODO: set heFFTe path for this machine (needed only when USE_HEFFTE=YES)
+HEFFTE_DIR  = $(HOME)/heffte
+HEFF_LIBR   = -L$(HEFFTE_DIR)/lib -lheffte
+HEFF_INCL   = -I$(HEFFTE_DIR)/include
+
+MPI_LIBR    = -L$(SMPI_ROOT)/lib -lmpi_ibm
+MPI_INCL    = -I$(SMPI_ROOT)/include
+GSL_LIBR    = -L$(GSL_LIB) -lgsl -lgslcblas -lm
+GSL_INCL    = -I$(GSL_INC)
+endif
+
+###################### PLEIADI ######################
+
+ifeq ($(SYSTYPE), Pleiadi)
+COMPILER_CC          =  mpicc
+COMPILER_CPP         =  mpic++
+SPACKHOME   =  ${SPACK_ENV}/.spack-env/view/
+CDEBUG      = -g -Wall $(OMP_FLAG)
+COPTIMIZED  = -O3 -Wno-unused-result $(OMP_FLAG)
+FFTW_LIBR   = -L$(SPACKHOME)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
+FFTW_INCL   = -I$(SPACKHOME)/include
+PFFT_LIBR   = -L$(SPACKHOME)/lib -lpfft
+PFFT_INCL   = -I$(SPACKHOME)/include
+MPI_LIBR    = -L$(SPACKHOME)/lib
+MPI_INCL    = -I$(SPACKHOME)/include
+GSL_LIBR    = -L$(SPACKHOME)/lib -lgsl -lgslcblas -lm
+GSL_INCL    = -I$(SPACKHOME)/include
+
+# heFFTe available via Spack environment on Pleiadi
+HEFFTE_DIR  = $(SPACKHOME)
+HEFF_LIBR   = -L$(SPACKHOME)/lib -lheffte
+HEFF_INCL   = -I$(SPACKHOME)/include
+endif
+
+########## System-specific Configuration end ##########
 
 # Include paths for libraries #
 
