@@ -31,13 +31,13 @@ RUNDIR = ./
 
 ########## System-specific Configuration ############################
 
-SYSTYPE ?= LeonardoBoost
+SYSTYPE ?= docker
 
 #####################################################################
 #####################################################################
 # The following variables should be passed from command line to make
 # Executable name
-EXEC         ?= pinocchio.x
+EXEC         ?= PinocchioFinal_GPU.x
 # Compilation options
 
 # C compiler
@@ -46,57 +46,89 @@ COMPILER_CPP ?= mpic++
 DEBUG        ?= NO
 OMP          ?= YES
 GPU          ?= NO
-FULL_GPU     ?= YES
+FULL_GPU     ?= NO
 SCOREP       ?= NO
 NSIGHT       ?= NO
-ENERGY_PARALLEL ?= NO
 ENERGY_CPU   ?= NO
 ENERGY_GPU   ?= NO
 ####################################################################
 
-########## Preprocessor Definitions ################################
-
-# Displacement LPT order # 
-
+########## Feature toggles (preprocessor definitions) ##########
+#
+# How to use:
+# - Edit the OPTIONS += -D<FLAG> lines below to enable/disable features.
+# - These options enable/disable code paths at compile time. Choose what you need
+#   for your run to reduce binary size and keep hot loops lean.
+# - The default profile here matches a typical Past Light-Cone (PLC) + Mass Maps
+#   run with snapshots and FITS output.
+#
+# LPT order (displacement field accuracy)
+# -DTWO_LPT                    Include second-order LPT term.
+# -DTHREE_LPT                  Include third-order LPT term (adds cost).
 OPTIONS += -DTWO_LPT
 OPTIONS += -DTHREE_LPT
 
-# PLC reconstruction
+# PLC + Mass Maps pipeline
+# -DPLC                        Enable past light-cone geometry and basis vectors.
+# -DMASS_MAPS                  Build per-segment HEALPix maps counting PLC entries.
+# -DHAVE_CFITSIO               Write FITS files (requires CFITSIO installed).
+# -DMASS_MAPS_FILTER_UNCOLLAPSED  Keep only entries with Z_PLC > Z_ACC (requires SNAPSHOT).
+# -DMASS_MAPS_THREAD_ACCUM     Use per-thread HEALPix accumulators to reduce atomics.
+# -DDISP_HISTOGRAM             Optional: write displacement magnitude histograms (debug/QA).
+OPTIONS += -DPLC
+#OPTIONS += -DMASS_MAPS
+#OPTIONS += -DHAVE_CFITSIO
+#OPTIONS += -DMASS_MAPS_FILTER_UNCOLLAPSED  # Z_PLC > Z_ACC (requires SNAPSHOT)
+#OPTIONS += -DDISP_HISTOGRAM               # Enable only when you need displacement QA
+#OPTIONS += -DMASS_MAPS_THREAD_ACCUM
 
-# OPTIONS += -DPLC
+# Mass-maps diagnostics (compile-time)
+# -DMASS_MAPS_CAP_DIAG=1        Enable cap prefix diagnostics (off by default)
+#   Tracks max accepted/missed angles and prefix misses; useful for aperture QA.
+# OPTIONS += -DMASS_MAPS_CAP_DIAG=1
 
-# Dynamics of triaxial collapse #
-
+# Triaxial collapse model (choose one)
+# -DELL_CLASSIC                Classic ellipsoidal collapse model (default).
+# -DELL_SNG                    Spherical-no-gravity approximation.
+# -DTABULATED_CT               Use tabulated collapse times from file.
 OPTIONS += -DELL_CLASSIC
-# OPTIONS += -DELL_SNG
-# OPTIONS += -DTABULATED_CT
 
-# Building groups and fragmentation #
+# Group building and fragmentation
+# -DCLASSIC_FRAGMENTATION       Use classic fragmentation instead of default.
 
-# OPTIONS += -DCLASSIC_FRAGMENTATION
+# Output and products
+# -DSNAPSHOT                   Populate products[] (z_acc, group_ID, displacements, etc.).
+#                              Required by MASS_MAPS_FILTER_UNCOLLAPSED.
+# -DLIGHT_OUTPUT               Reduce output footprint.
+# -DLONGIDS                    Use 64-bit particle IDs.
+# -DDOUBLE_PRECISION_PRODUCTS  Store products in double precision.
+OPTIONS += -DSNAPSHOT
+OPTIONS += -DLONGIDS
 
-# Output #
+# Beyond ΛCDM and solver options
+# Neutrinos and scale-dependent growth:
+# -DSCALE_DEPENDENT            Enable k-dependent growth (FFT per segment).
+# -DREAD_PK_TABLE              Read external P(k) table (implies scale dependence).
+#
+# Displacement engine:
+# -DRECOMPUTE_DISPLACEMENTS    Maintain prev/curr segment fields (needed for PLC crossings).
+# -DREAD_HUBBLE_TABLE          Read H(z) table for precise distances.
+# -DMASS_MAPS_MATCH_DIAG       Extra cross-matching diagnostics (debug).
+# -DUSE_DISTRIBUTE_ALLTOALL    Use all-to-all variant for forward product redistribution.
+#OPTIONS += -DMASS_MAPS_MATCH_DIAG
+#OPTIONS += -DREAD_PK_TABLE
+OPTIONS += -DUSE_DISTRIBUTE_ALLTOALL
 
-# OPTIONS += -DSNAPSHOT
-# OPTIONS += -DLIGHT_OUTPUT
-# OPTIONS += -DLONGIDS
-# OPTIONS += -DDOUBLE_PRECISION_PRODUCTS
+# f(R) gravity:
+# -DMOD_GRAV_FR                Enable modified gravity model (f(R)).
+# -DFR0=1.e-8                  Example FR parameter value.
+OPTIONS += -DRECOMPUTE_DISPLACEMENTS
+#OPTIONS += -DREAD_HUBBLE_TABLE
 
-# Beyond LambdaCDM models
 
-# these are for neutrino cosmology
-# OPTIONS += -DSCALE_DEPENDENT
-# OPTIONS += -DREAD_PK_TABLE
-# OPTIONS += -DONLY_MATTER_POWER
-# OPTIONS += -DRECOMPUTE_DISPLACEMENTS
-
-# add also these for f(R) gravity
-# OPTIONS += -DMOD_GRAV_FR
-# OPTIONS += -DFR0=1.e-8
-
-# Other options # 
-
-# OPTIONS += -DWHITENOISE
+# Other options
+# -DWHITENOISE                  White-noise ICs.
+# -DNORADIATION                 Neglect radiation component.
 OPTIONS += -DNORADIATION
 
 
@@ -130,12 +162,13 @@ ENERGY = NO
 
 ifeq ($(ENERGY_CPU), YES)
 ENERGY = YES
-OPTIONS += -D_MPICH_   # switch-on CPU power measurements through RAPL counters
+OPTIONS += -D_ENERGY_RAPL_   # switch-on CPU power measurements through RAPL counters
 endif
 
 ifeq ($(ENERGY_GPU), YES)
 ENERGY   = YES
 OPTIONS += -D_ENERGY_NVIDIA_ # switch-on NVIDIA GPU power measurements
+# OPTIONS += -D_ENERGY_AMD_    # switch-on AMD GPU power measurements
 endif
 
 ifeq ($(ENERGY), YES)
@@ -149,16 +182,15 @@ endif
 
 ######################################################
 ####################### GPU flag ####################
-GPU_FLAG = 
 
 ifeq ($(GPU), YES)
 OPTIONS += -DGPU_OMP
-GPU_FLAG = -gpu=ccnative -target=gpu
+GPU_FLAG = -gpu=ccnative -target=gpu #-gpu=nomanaged
 endif
 
 ifeq ($(FULL_GPU), YES)
 OPTIONS += -DGPU_OMP_FULL
-GPU_FLAG = -mp=gpu -target=gpu -gpu=ccnative
+GPU_FLAG = -gpu=ccnative -target=gpu #-gpu=nomanaged
 endif
 
 ifeq ($(NSIGHT), YES)
@@ -179,17 +211,16 @@ endif
 # OpenMP Configuration #
 
 ifeq ($(OMP), YES)
-OPTIONS += -DUSE_FFT_THREADS
-# OMP_FLAG = -mp=multicore
+
 OMP_FLAG = -fopenmp
-OMP_FFTW = -lfftw3_omp -lfftw3_threads
+OMP_FFTW = -lfftw3_omp 
 
 ifeq ($(GPU), YES)
-# OMP_FLAG = -mp=multicore,gpu
+OMP_FLAG = -mp=multicore,gpu
 endif
 
 ifeq ($(FULL_GPU), YES)
-# OMP_FLAG = -mp=multicore,gpu
+OMP_FLAG = -mp=multicore,gpu
 endif
 
 else
@@ -199,104 +230,120 @@ endif
 
 ifeq ($(FULL_GPU), YES)
 # OMP_FLAG = -mp=gpu
-endif
+endif 
 
-OMP_FLAG =
-OMP_FFTW =
+OMP_FFTW = -lfftw3_omp
 endif # OMP, YES
 
 ########################### SYSTYPE CONFIGURATION ###################################
+###################### DOCKER  ######################
 
-###################### LeonardoBoost ######################
+ifeq ($(SYSTYPE),docker)
+CC          =  mpicc
+CDEBUG      = -ggdb3 -Wall $(OMP_FLAG)
+COPTIMIZED  = -O3 -Wno-unused-result $(OMP_FLAG)
+FFTW_LIBR   = -L/usr/local/fftw3/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
+FFTW_INCL   = -I/usr/local/fftw3/include
+PFFT_LIBR   = -L/usr/local/pfft/lib -lpfft
+PFFT_INCL   = -I/usr/local/pfft/include
 
+HEFFTE_DIR  = /usr/local/heffte/
+HEFF_LIBR   = -L$(HEFFTE_DIR)/lib -lheffte
+HEFF_INCL   = -I$(HEFFTE_DIR)/include
+
+MPI_LIBR    =
+MPI_INCL    =
+GSL_LIBR    = -L$(HOME)/lib -lgsl -lgslcblas -lm
+GSL_INCL    = -I$(HOME)/include/gsl
+endif
+###################### LEONARDO ######################
 ifeq ($(SYSTYPE), LeonardoBoost)
 
 CDEBUG      = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
-COPTIMIZED  = -O3 -fast -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
+COPTIMIZED  = -O3 -fast -Minfo=all -v -Mneginfo $(OMP_FLAG)
+
+MPI         = /leonardo/prod/opt/libraries/openmpi/4.1.6/nvhpc--24.3/
+MPI_LIBR    = -L$(MPI)/lib -lmpi
+MPI_INCL    = -I$(MPI)/include
 
 LIBDIR      = /leonardo_scratch/fast/CNHPC_1498509/lib/nvhpc-23.11
+
 FFTW        = $(LIBDIR)/fftw/fftw-3.3.10
 FFTW_LIBR   = -L$(FFTW)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
 FFTW_INCL   = -I$(FFTW)/include
 
+HEFFTE_DIR  = /leonardo/pub/userexternal/dgoz0000/libraries
+HEFF_LIBR   = -L$(HEFFTE_DIR)/heffte_nvidia/lib64 -lheffte
+HEFF_INCL   = -I$(HEFFTE_DIR)/heffte_nvidia/include
 
 GSL         = $(LIBDIR)/gsl/gsl-2.7.1
 GSL_LIBR    = -L$(GSL)/lib -lgsl -lgslcblas -lm
 GSL_INCL    = -I$(GSL)/include
 
-PFFT        = $(LIBDIR)/pfft/pfft
-PFFT_LIBR   = -L$(PFFT)/lib -lpfft
-PFFT_INCL   = -I$(PFFT)/include
+PMT         = /leonardo_scratch/fast/CNHPC_1498509/lib/pmt/local
+PMT_LIBR    = -L$(PMT)/lib64 -lpmt
+PMT_INCL    = -I$(PMT)/include
+
+HEALPIX_ROOT = /leonardo_scratch/large/userexternal/tbatalha/Pinocchio/dep/Healpix_3.83/
+CFITSIO_ROOT = /leonardo_scratch/large/userexternal/tbatalha/Pinocchio/dep/
+
+HEALPIX_INCL = -I$(HEALPIX_ROOT)/include
+HEALPIX_LIBR = -L$(HEALPIX_ROOT)/lib -lchealpix
+
+CFITSIO_INCL = -I$(CFITSIO_ROOT)/include
+CFITSIO_LIBR = -L$(CFITSIO_ROOT)/lib -lcfitsio
 
 
 endif
 
-ifeq ($(SYSTYPE), Magellanus)
+ifeq ($(SYSTYPE), LeonardoDCGP)
 
-CDEBUG      = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
-COPTIMIZED  = -O3 -fast -Minfo=all -v -Mneginfo -march=native -mtune=native -fomit-frame-pointer $(GPU_FLAG) $(OMP_FLAG)
-#COPTIMIZED  = -O3 -march=native -mtune=native -fomit-frame-pointer -ftree-vectorize $(GPU_FLAG) $(OMP_FLAG)
-#COPTIMIZED  = -g -O3 -march=native -mtune=native $(GPU_FLAG) $(OMP_FLAG)
-#COPTIMIZED      = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
+CC          =  mpicc
+CDEBUG      = -ggdb3 -Wall $(OMP_FLAG)
+COPTIMIZED  = -O3 -Wno-unused-result $(OMP_FLAG)
 
-##################### DA CAMBIARE ###############################
-# GPU_FLAG   = -gpu=ccnative,debug,lineinfo -target=gpu -gpu=nomanaged
-# OMP_FLAG   = -mp=multicore,gpu
-# COPTIMIZED = -g -O0 -Minfo=all -v -Mneginfo $(GPU_FLAG) $(OMP_FLAG)
-##############################################################
+FFTW_LIBR   = -L$(FFTW_LIB) -lfftw3_mpi -lfftw3 $(OMP_FFTW)
+FFTW_INCL   = -I$(FFTW_INC)
 
-LIBDIR      = /data/NVC_LIB
-FFTW        = $(LIBDIR)/FFT_lib/fftw-3.3.10/local
-FFTW_LIBR   = -L$(FFTW)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
-FFTW_INCL   = -I$(FFTW)/include
+GSL_LIBR    = -L$(GSL_LIB) -lgsl -lgslcblas -lm
+GSL_INCL    = -I$(GSL_INC)
 
-GSL         = $(LIBDIR)/gsl-2.8/local
-GSL_LIBR    = -L$(GSL)/lib -lgsl -lgslcblas -lm
-GSL_INCL    = -I$(GSL)/include
+PFFT_ROOT   = /leonardo_scratch/large/userexternal/tbatalha/Pinocchio/dep/
+PFFT_LIBR   = -L$(PFFT_ROOT)/lib -lpfft
+PFFT_INCL   = -I$(PFFT_ROOT)/include
 
-PFFT        = $(LIBDIR)/FFT_lib/pfft/pfft-1.0.8-alpha/local
-PFFT_LIBR   = -L$(PFFT)/lib -lpfft
-PFFT_INCL   = -I$(PFFT)/include
+HEALPIX_ROOT = /leonardo_scratch/large/userexternal/tbatalha/Pinocchio/dep/Healpix_3.83/
+CFITSIO_ROOT = /leonardo_scratch/large/userexternal/tbatalha/Pinocchio/dep/
 
+HEALPIX_INCL = -I$(HEALPIX_ROOT)/include
+HEALPIX_LIBR = -L$(HEALPIX_ROOT)/lib -lchealpix
 
-PMT         = /space/Giovanni/Pinocchio_dev/Pinocchio_parallel_pmt/src/energy_parallel
-PMT_LIBR    = -L$(PMT) -lpmt_parallel
-PMT_INCL    = -I$(PMT)
+CFITSIO_INCL = -I$(CFITSIO_ROOT)/include
+CFITSIO_LIBR = -L$(CFITSIO_ROOT)/lib -lcfitsio
 
 endif
-
-##########################################################################
-
-
-# ###################### PLEIADI ######################
-
-# ifeq ($(SYSTYPE), pleiadi)
-
-COPTIMIZED  = -O3 -g -fopenmp -march=native -mtune=native -ftree-vectorize
-FFTW        = /u/dgoz/lib/fftw-3.3.10_pleiadi
-FFTW_LIBR   = -L$(FFTW)/lib -lfftw3_mpi -lfftw3 $(OMP_FFTW)
-FFTW_INCL   = -I$(FFTW)/include
-PFFT        = /u/dgoz/lib/pfft-1.0.8-alpha_pleiadi
-PFFT_LIBR   = -L$(PFFT)/lib -lpfft
-PFFT_INCL   = -I$(PFFT)/include
-MPI_LIBR    =
-MPI_INCL    =
-GSL         = /u/dgoz/lib/gsl-2.7.1_pleiadi
-GSL_LIBR    = -L$(GSL)/lib -lgsl -lgslcblas -lm
-GSL_INCL    = -I$(GSL)/include
-
-# endif
-######################################################
 
 ########## System-specific Configuration end ########## 
 
 # Include paths for libraries #
 
-INC =  $(PFFT_INCL) $(FFTW_INCL) $(MPI_INCL) $(GSL_INCL) $(PMT_INCL)
+INC =  $(HEFF_INCL) $(FFTW_INCL) $(MPI_INCL) $(GSL_INCL) $(PMT_INCL) 
+
+# INC =  $(PFFT_INCL) $(FFTW_INCL) $(MPI_INCL) $(GSL_INCL)  $(PMT_INCL) # for DCGP
 
 # Library flags #
 
-LIB = -lm $(PFFT_LIBR) $(FFTW_LIBR) $(MPI_LIBR) $(GSL_LIBR) $(PMT_LIBR)
+###############################################################
+# HEALPix / CFITSIO configuration (override from environment)
+###############################################################
+
+# Append their include paths
+#INC += $(HEALPIX_INCL) $(CFITSIO_INCL) 
+
+# Append their libraries (placed after math deps)
+LIB =  -lm $(HEFF_LIBR) $(FFTW_LIBR) $(MPI_LIBR) $(GSL_LIBR) $(CFITSIO_LIBR) $(HEALPIX_LIBR)
+
+# LIB =  -lm $(PFFT_LIBR) $(FFTW_LIBR) $(MPI_LIBR) $(GSL_LIBR) $(CFITSIO_LIBR) $(HEALPIX_LIBR) # for DCGP
 
 # Compiler options : choose from CDEBUG or COPTIMIZED #
 
@@ -306,21 +353,26 @@ else
 COPTS = $(COPTIMIZED)
 endif
 
-# Print GPU_FLAG and COPTS for debugging
-$(info GPU_FLAG = $(GPU_FLAG))
-$(info COPTS    = $(COPTS))
-
-
 # Source files #
 
-OBJECTS = fmax.o  variables.o  cubic_spline_interpolation.o cubic_spline_interpolation_full_GPU.o cosmo.o initialization.o fmax-pfft.o GenIC.o \
-	ReadParamfile.o allocations.o LPT.o distribute.o collapse_times.o collapse_times_GPU.o \
-	fragment.o build_groups.o write_halos.o write_snapshot.o pinocchio.o mpi_debugger.o
+OBJECTS = fmax.o variables.o  cubic_spline_interpolation.o cubic_spline_interpolation_full_GPU.o \
+          initialization.o collapse_times.o collapse_times_GPU.o fmax-heffte.o GenIC.o \
+	      ReadParamfile.o allocations.o LPT.o distribute.o \
+	      fragment.o build_groups.o write_halos.o write_snapshot.o write_mass_maps.o cosmo.o 
+
+ifeq ($(ENERGY), YES)
+OBJECTS += energy_pmt_methods.o
+endif
+
+# For DCGP
+# OBJECTS = fmax.o variables.o initialization.o collapse_times.o fmax-pfft.o GenIC.o \
+# 	ReadParamfile.o allocations.o LPT.o distribute.o \
+# 	fragment.o build_groups.o write_halos.o write_snapshot.o write_mass_maps.o cosmo.o
 
 # Main targets and rules
 
-$(EXEC): $(OBJECTS) Makefile
-	$(SCOREP_FLAG) $(COMPILER) -lstdc++ $(COPTS) $(OPTIONS) -o $(RUNDIR)$(EXEC) $(OBJECTS) $(LIB)
+pinocchio: $(OBJECTS) pinocchio.o Makefile
+	$(SCOREP_FLAG) $(COMPILER) $(COPTS) $(OPTIONS) -o $(RUNDIR)$(EXEC) pinocchio.o $(OBJECTS) $(LIB)
 	ldd $(RUNDIR)$(EXEC)
 
 run_planner: $(OBJECTS) run_planner.o Makefile
@@ -328,15 +380,46 @@ run_planner: $(OBJECTS) run_planner.o Makefile
 
 # Generic rule for compiling source files #
 
-#energy_pmt_methods.o: energy_parallel/energy_pmt_methods.cpp Makefile energy_parallel/energy_pmt_methods.h energy_parallel/energy_pmt.h
+energy_pmt_methods.o: energy/energy_pmt_methods.cpp Makefile energy/energy_pmt_methods.h energy/energy_pmt.h
 	# g++ -std=c++17 $(OPTIONS) $(PMT_INCL) -c $< -o $@
-#	$(COMPILER_CPP) -std=c++17 $(OPTIONS) $(PMT_INCL) -c $< -o $@
+	$(COMPILER_CPP) -std=c++17 $(OPTIONS) $(PMT_INCL) -c $< -o $@
 
-%.o: %.c Makefile pinocchio.h def_splines.h 
-	$(SCOREP_FLAG) $(COMPILER_CC) $(INC) $(COPTS) $(OPTIONS) -c $<
-
+%.o: %.c Makefile pinocchio.h def_splines.h
+	echo "Make objects $(SCOREP_FLAG) $(COMPILER_CC) $(INC) $(COPTS) $(OPTIONS) "
+	$(SCOREP_FLAG) $(COMPILER_CC) $(INC) $(COPTS) $(OPTIONS)  -c $<
 
 # Clean target #
 
 clean:
-	rm -f *.o *~ $(EXEC) run_planner
+	\rm -f *.o *~ $(EXEC) run_planner
+
+###############################################################
+# Documentation
+###############################################################
+# Generates HTML docs from in-source Doxygen comments.
+#
+# Usage:
+#   make docs            # builds HTML docs under ../docs/build/html
+#   make docs-clean      # removes generated docs
+#
+# Requirements:
+#   - doxygen installed and available on PATH
+#   - config: ../docs/Doxyfile (provided in repo)
+
+.PHONY: docs docs-clean
+
+DOXYGEN ?= doxygen
+DOCDIR  ?= ../docs
+DOXYCFG ?= $(DOCDIR)/Doxyfile
+
+docs:
+	@command -v $(DOXYGEN) >/dev/null 2>&1 || { \
+	  echo "Error: doxygen not found. Install doxygen and re-run 'make docs'."; \
+	  exit 1; \
+	}
+	@echo "Generating documentation with $$( $(DOXYGEN) --version )..."
+	@cd $(DOCDIR) && $(DOXYGEN) Doxyfile
+	@echo "Docs available at $(DOCDIR)/build/html/index.html"
+
+docs-clean:
+	@rm -rf $(DOCDIR)/build

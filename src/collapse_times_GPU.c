@@ -329,17 +329,12 @@ int compute_collapse_times_gpu(int ismooth)
       common_initialization_gpu(total_size);
     }
 
-  
+  /* PMT measure */
+  PMT_CPU_START("collapse_time_CPU", ThisTask);
+  PMT_GPU_START("collapse_time_GPU", devID, ThisTask);
   /* timing the main loop of 'compute_collapse_times' function */
   double cputmp, tmp;  
   cputmp = tmp = MPI_Wtime();  
-
-  /* PMT measure */
-
-  
-  // PMT_CPU_START("collapse_time_CPU");
-  // PMT_GPU_START("collapse_time_GPU", devID);
-  
   
   /*--------------------- GPU memory movements ----------------------------------------*/
 
@@ -527,15 +522,12 @@ int compute_collapse_times_gpu(int ismooth)
   gputime.memory_transfer.collapse_times += (MPI_Wtime() - tmp);
 
   /* CPU collapse time */	
-
-  /* PMT measures */
-  
-  // PMT_CPU_STOP("collapse_time_CPU");
-  // PMT_GPU_STOP("collapse_time_GPU", devID);
-  
   cputime.coll += (MPI_Wtime() - cputmp);
 
-    
+  /* PMT measures */
+  PMT_CPU_STOP("collapse_time_CPU", ThisTask);
+  PMT_GPU_STOP("collapse_time_GPU", devID, ThisTask);
+  
   #pragma omp parallel for
   for (unsigned int index=0 ; index<total_size ; index++)
     {
@@ -560,6 +552,7 @@ int compute_collapse_times_gpu(int ismooth)
 	
   /* Stores the true variance*/
   Smoothing.TrueVariance[ismooth] = global_variance;
+  
   
   
   return 0;

@@ -1,14 +1,12 @@
 /*****************************************************************
- *                        PINOCCHIO  V5.1                        *
+ *                        PINOCCHI0  V4.0                        *
  *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  *
  *****************************************************************
  
  This code was written by
- Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan, 
- Chiara Moretti, Luca Tornatore, David Goz, Tiago Castro
- Copyright (C) 2025
+ Pierluigi Monaco
+ Copyright (C) 2016
  
- github: https://github.com/pigimonaco/Pinocchio
  web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html
  
  This program is free software; you can redistribute it and/or modify
@@ -27,6 +25,7 @@
 */
 
 #include "pinocchio.h"
+
 
 // -------------------------
 // defines and variables
@@ -78,108 +77,127 @@ int cubes_order(const void *A, const void *B)
 
 int set_one_grid(int ThisGrid)
 {
-  ptrdiff_t    alloc_local;
-  unsigned int pfft_flags;
-
-  GRID.norm = (double)1.0 /
-    ((double)GRID.Ntotal);
   
   GRID.CellSize = (double)GRID.BoxSize / GRID.GSglobal[_x_];
 
-  //pfft_flags  = PFFT_MEASURE;
-  pfft_flags  = 0;
-  if(params.use_transposed_fft)
-    pfft_flags  |= PFFT_TRANSPOSED_OUT;
+  //int NTasks;
+  //MPI_Comm_size(MPI_COMM_WORLD, &NTasks);
+  
+  /* Set decomposition for heffte */
 
-  alloc_local = pfft_local_size_dft_r2c_3d(GRID.GSglobal, FFT_Comm, pfft_flags,
-					   GRID.GSlocal, GRID.GSstart,
-					   GRID.GSlocal_k, GRID.GSstart_k);
+  /* Remember that _x_ and _z_ axes must be reversed
+     to ensure correctness of results with PFFT */
 
+  long int local_x = MyGrids[0].GSglobal[_x_] / NTasks;
+  long int rem     = MyGrids[0].GSglobal[_x_] % NTasks;
+  
+  long int local_x_start = ThisTask * local_x + (ThisTask < rem ? ThisTask : rem);
+  long int local_x_count = local_x + (ThisTask < rem ? 1 : 0);
+  long int local_x_end   = local_x_start + local_x_count - 1;
+ 
+  
+  /* Construct inboxes and outboxes for each task 
+     For a L*M*N matrix, indices must go up to L-1, M-1, N-1 */
+  inbox_low[_x_]   = (int)local_x_start;
+  inbox_low[_y_]   = 0;
+  inbox_low[_z_]   = 0;
+  inbox_high[_x_]  = (int)local_x_end;
+  inbox_high[_y_]  = (int)MyGrids[0].GSglobal[_y_]-1;
+  inbox_high[_z_]  = (int)MyGrids[0].GSglobal[_z_]-1;
+  outbox_low[_x_]  = (int)local_x_start;
+  outbox_low[_y_]  = 0;
+  outbox_low[_z_]  = 0;
+  outbox_high[_x_] = (int)local_x_end;
+  outbox_high[_y_] = (int)MyGrids[0].GSglobal[_y_]-1;
+  outbox_high[_z_] = (int)MyGrids[0].GSglobal[_z_]/2;
+      
+  /* Try to adapt Heffte to PFFT */
+  
+  GRID.GSlocal[_x_] = local_x_count;
+  GRID.GSlocal[_y_] = MyGrids[0].GSglobal[_y_];
+  GRID.GSlocal[_z_] = MyGrids[0].GSglobal[_z_];
+
+  GRID.GSlocal_k[_x_] = local_x_count;
+  GRID.GSlocal_k[_y_] = MyGrids[0].GSglobal[_y_];
+  GRID.GSlocal_k[_z_] = MyGrids[0].GSglobal[_z_]/2 + 1;
+  
+  GRID.GSstart[_x_] = local_x_start;
+  GRID.GSstart[_y_] = 0;
+  GRID.GSstart[_z_] = 0;
+  
+  GRID.GSstart_k[_x_] = local_x_start;
+  GRID.GSstart_k[_y_] = 0;
+  GRID.GSstart_k[_z_] = 0;
+
+  //GRID.total_local_size_fft = GRID.GSlocal[_x_] * GRID.GSlocal[_y_] * GRID.GSlocal[_z_];
+  GRID.total_local_size     = GRID.GSlocal[_x_] * GRID.GSlocal[_y_] * GRID.GSlocal[_z_];  
+
+  cvector_size = GRID.GSlocal_k[_x_] * GRID.GSlocal_k[_y_] * GRID.GSlocal_k[_z_];
+
+  GRID.total_local_size_fft = 2 * cvector_size;
+  // printf("Rank %d: total local size fft %ld; total local size fft / 2 %ld, size complex %ld\n",
+	//  ThisTask,
+	//  GRID.total_local_size_fft,
+	//  GRID.total_local_size_fft/2,
+	//  GRID.GSlocal_k[_x_] * GRID.GSlocal_k[_y_] * GRID.GSlocal_k[_z_]);
   
   dprintf(VDBG, ThisTask, "[set grid %02d] task %d %ld "
 	  "i: %ld %ld %ld - i start: %ld %ld %ld - "
 	  "o: %ld %ld %ld - o start: %ld %ld %ld\n",
-	  ThisGrid, ThisTask, alloc_local,
+	  ThisGrid, ThisTask, GRID.total_local_size,
 	  GRID.GSlocal[_x_], GRID.GSlocal[_y_], GRID.GSlocal[_z_],
 	  GRID.GSstart[_x_], GRID.GSstart[_y_], GRID.GSstart[_z_],
 	  GRID.GSlocal_k[_x_], GRID.GSlocal_k[_y_], GRID.GSlocal_k[_z_],
 	  GRID.GSstart_k[_x_], GRID.GSstart_k[_y_], GRID.GSstart_k[_z_]);
   
-  
-  GRID.total_local_size_fft = 2 * alloc_local;
-  GRID.total_local_size     = GRID.GSlocal[_x_] * GRID.GSlocal[_y_] * GRID.GSlocal[_z_];  
-  
-  MyGrids[0].off = 0;
-  // order the sub-blocks by row-major order (i, j, k), k first, then j, then i
-
-  /* int           i; */
-  /* unsigned int index; */
-
-  /* starts         = (point*)malloc(sizeof(point) * NTasks); */
-  
-  /* MPI_Allgather(GRID.GSlocal, sizeof(point), MPI_BYTE, starts, sizeof(point), MPI_BYTE, MPI_COMM_WORLD); */
-  /* for(i = 0; i < NTasks; i++) */
-  /*   { */
-  /*     index            = (starts[i][_x_]*GRID.GSglobal[_y_] + starts[i][_y_])*GRID.GSglobal[_z_] + starts[i][_z_]; */
-  /*     starts[i][_x_]   = index; */
-  /*     cubes_ordering[i] = i; */
-  /*   } */
-
-  /* qsort(cubes_ordering, NTasks, sizeof(int), cubes_order); */
-
-  /* free(starts); */
-  
   return 0;
 }
-
+  
 
 
 
 int compute_fft_plans()
 {
   ptrdiff_t DIM[3];
-  int       pfft_flags;
+  //int       pfft_flags;
   int       ThisGrid;
   
   dprintf(VMSG, 0, "[%s] Computing fft plans\n",fdate());
 
+  int order[3] = {2,1,0};
+  
   for (ThisGrid = 0; ThisGrid < Ngrids; ThisGrid++)
-    {
+    { 
+      /* Check that the plan is created correctly */
+      int heffte_err;
+      
+      // printf("Task %d: Inbox low: %d, %d, %d\n, Inbox high: %d, %d, %d\n",
+	    //  ThisTask,
+	    //  inbox_low[0], inbox_low[1], inbox_low[2],
+	    //  inbox_high[0], inbox_high[1], inbox_high[2]);
+      
+      heffte_err = heffte_plan_create_r2c(BACKEND, inbox_low, inbox_high, order,
+					  outbox_low, outbox_high, order,
+					  2, MPI_COMM_WORLD, &options_fft, &GRID.plan);
+      
+ 
+      //printf("Rank %d --> Device %d\n", ThisTask, devID);
+      
+      if (heffte_err != Heffte_SUCCESS)
+	{
+	  printf("Heffte error in plan create %d", heffte_err);
+	  return 1;
+	}
 
-      DIM[_x_] = GRID.GSglobal[_x_];
-      DIM[_y_] = GRID.GSglobal[_y_];
-      DIM[_z_] = GRID.GSglobal[_z_];
-
-      /* create plan for out-of-place DFT */
-
-      //pfft_flags = PFFT_MEASURE | PFFT_TUNE;
-      //pfft_flags = PFFT_MEASURE ;
-      pfft_flags = 0;
-      if(params.use_transposed_fft)
-	pfft_flags |= PFFT_TRANSPOSED_OUT;
-#ifdef USE_FFT_THREADS
-      fftw_plan_with_nthreads(internal.nthreads_fft);
-#endif
-      GRID.forward_plan = pfft_plan_dft_r2c_3d(DIM, rvector_fft[ThisGrid], cvector_fft[ThisGrid],
-					       FFT_Comm, PFFT_FORWARD, pfft_flags);
-
-
-      DIM[_x_] = GRID.GSglobal[_x_];
-      DIM[_y_] = GRID.GSglobal[_y_];
-      DIM[_z_] = GRID.GSglobal[_z_];
-
-      //pfft_flags = PFFT_MEASURE | PFFT_TUNE;
-      //pfft_flags = PFFT_MEASURE;
-      pfft_flags = 0;
-      if(params.use_transposed_fft)
-	pfft_flags |= PFFT_TRANSPOSED_IN;
-#ifdef USE_FFT_THREADS
-      fftw_plan_with_nthreads(internal.nthreads_fft);
-#endif
-      GRID.reverse_plan = pfft_plan_dft_c2r_3d(DIM, cvector_fft[ThisGrid], rvector_fft[ThisGrid], 
-					       FFT_Comm, PFFT_BACKWARD, pfft_flags);
+      /* Define inbox size, outbox size and workspace */
+      int inbox_size  = heffte_size_inbox(GRID.plan);
+      int outbox_size = heffte_size_outbox(GRID.plan);
+    
+      // printf("Task %d: inbox size %d; outbox size %d\n",
+	    //  ThisTask, inbox_size, outbox_size);
     }
 
+  /* NO REVERSE PLAN IS NEEDED FOR HEFFTE */
 
   dprintf(VMSG, 0, "[%s] fft plans done\n",fdate());
 
@@ -191,38 +209,60 @@ double forward_transform(int ThisGrid)
 {
   double time;
   
+  struct my_double_complex * cvector_fft1 = cvector_fft[ThisGrid];
+  double * rvector_fft1 = rvector_fft[ThisGrid];
+  
   time=MPI_Wtime();
 
-  pfft_execute(GRID.forward_plan);
+ #ifdef GPU_OMP_FULL
+ #pragma omp target update to(rvector_fft[ThisGrid][0:GRID.total_local_size]) device(devID)
+ #endif //GPU_OMP_FULL
 
+  double time_comp = MPI_Wtime();
+
+ #ifdef GPU_OMP_FULL
+#pragma omp target data use_device_addr(cvector_fft1, rvector_fft1) device(devID)
+ #endif //GPU_OMP_FULL
+  heffte_forward_d2z(GRID.plan, rvector_fft1, cvector_fft1, Heffte_SCALE_NONE);
+
+  cputime.fft_compute += MPI_Wtime() - time_comp;
+
+ #ifdef GPU_OMP_FULL
+ #pragma omp target update from(cvector_fft[ThisGrid][0:cvector_size]) device(devID)
+ #endif //GPU_OMP_FULL
+  
   return MPI_Wtime()-time;
 }
 
 
 double reverse_transform(int ThisGrid)
 {
-
-  int i;
   double time;
-
+  
+  struct my_double_complex * cvector_fft1 = cvector_fft[ThisGrid];
+  double * rvector_fft1 = rvector_fft[ThisGrid];
+    
   time=MPI_Wtime();
 
-  pfft_execute(GRID.reverse_plan);
+ #ifdef GPU_OMP_FULL
+ #pragma omp target update to(cvector_fft[ThisGrid][0:cvector_size]) device(devID)
+ #endif //GPU_OMP_FULL
 
-//  dvec         NORM   = {GRID.norm, GRID.norm, GRID.norm, GRID.norm};
-//  unsigned int mysize = GRID.total_local_size_fft / 4;
+  double time_comp = MPI_Wtime();
 
-// #pragma GCC ivdep  
-//   for (i = 0; i < mysize; i++)
-//     rvector_fft[ThisGrid][i] *= NORM;
-    
-  for (i = GRID.total_local_size_fft - GRID.total_local_size_fft%4 ; i < GRID.total_local_size_fft; i++)
-    rvector_fft[ThisGrid][i] *= GRID.norm;
+ #ifdef GPU_OMP_FULL
+#pragma omp target data use_device_addr(cvector_fft1, rvector_fft1) device(devID)
+ #endif //GPU_OMP_FULL
+  
+  /* Heffte_SCALE_FULL accounts for the inverse transform normalization */
+  heffte_backward_z2d(GRID.plan, cvector_fft1, rvector_fft1, Heffte_SCALE_FULL);
 
-  // non-vector code 
-  for (i = 0 ; i < GRID.total_local_size_fft; i++)
-      rvector_fft[ThisGrid][i] *= GRID.norm;
+  cputime.fft_compute += MPI_Wtime() - time_comp;
 
+ #ifdef GPU_OMP_FULL
+ #pragma omp target update from(rvector_fft[ThisGrid][0:GRID.total_local_size]) device(devID)
+ #endif //GPU_OMP_FULL
+  
   return MPI_Wtime() - time;
 }
 
@@ -234,17 +274,20 @@ int finalize_fft()
 
   for (ThisGrid = Ngrids-1; ThisGrid >= 0; ThisGrid--)
     {
-      pfft_destroy_plan(GRID.forward_plan);
+      heffte_plan_destroy(GRID.plan);
+      if (deallocate_fft_vectors(ThisGrid))
+	return 1;
+      
+      //#ifdef GPU_OMP_FULL
+      //#pragma omp target exit data map(delete: rvector_fft[ThisGrid], cvector_fft[ThisGrid])
+      //#endif //GPU_OMP_FULL
     }
 
-  /* for (ThisGrid = Ngrids-1; ThisGrid >= 0; ThisGrid--) */
-  /*   { */
-  /*     pfft_free(GRID.forward_plan); */
-  /*     pfft_free(GRID.reverse_plan); */
-  /*   } */
-
-  pfft_cleanup();
-  MPI_Comm_free(&FFT_Comm);
+ #if defined(_OPENMP) && !defined(GPU_OMP_FULL)
+  fftw_cleanup_threads();
+ #endif //threads
+  
+  //MPI_Comm_free(&MPI_COMM_WORLD);
 #endif
 
   return 0;
@@ -255,6 +298,9 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
 {
   int    swap, local[3], start[3], C[3], N[3], Nhalf[3];
   double knorm[3];
+#ifdef SCALE_DEPENDENT
+  double k_module;
+#endif
   
 #ifdef DEBUG
   sprintf(filename,"results.%d-%d.%d",first_derivative,second_derivative,ThisTask);
@@ -266,11 +312,13 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
   // In 1D the memory order is [ y, x, z ], while in 2D and 3D
   // it is [ y, z, x].
 
+  /* GINOCCHIO_CHECK */
+  //
   
   if(!params.use_transposed_fft)
     // this is the non-transposed order x, y, z    
     for(int i = 0; i < 3; i++)
-      C[i] = i;
+    C[i] = i;
   else
     {
       if(internal.tasks_subdivision_dim > 1)
@@ -278,18 +326,18 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
       else
 	C[0] = _y_, C[1] = _x_, C[2] = _z_;
     }
-
+  
   for(int i = 0; i < 3; i++)
     {
       // grid number
-      N[i]     = GRID.GSglobal[C[i]];
+      N[C[i]]     = GRID.GSglobal[C[i]];
       // Nyquist frequencies
-      Nhalf[i] = N[i] / 2;
+      Nhalf[C[i]] = N[i] / 2;
       // k vectors
-      knorm[i] = 2.*PI / (double)GRID.GSglobal[ C[i] ];
+      knorm[C[i]] = 2.*PI / (double)GRID.GSglobal[ C[i] ];
       
-      local[i] = GRID.GSlocal_k[C[i]];
-      start[i] = GRID.GSstart_k[C[i]];
+      local[C[i]] = GRID.GSlocal_k[C[i]];
+      start[C[i]] = GRID.GSstart_k[C[i]];
 
     }
 
@@ -336,6 +384,8 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
 	      double k_z  = knorm[_z_] * ii[_z_];
 
               double k_squared  = k2_1 + k_z * k_z;
+
+	      //#ifdef SCALE_DEPENDENT
 	      double k_module = sqrt(k_squared);
 
 	      /* In the scale-dependent case the delta(k) must be multiplied 
@@ -361,6 +411,7 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
 		  growth_rate = 1.0;
 		  break;
 		}
+	      //#endif
 
 	      int index = 2*(( idx * local[_y_] + idy ) * local[_z_] + idz);
 	      
@@ -381,15 +432,15 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
 
 		  double green = greens_function(diff_comp, k_squared, first_derivative, second_derivative);
 
-		  (cvector_fft[ThisGrid][index/2])[0] *=  green * smoothing * growth_rate;
-		  (cvector_fft[ThisGrid][index/2])[1] *=  green * smoothing * growth_rate;
+		  cvector_fft[ThisGrid][index/2].real *=  green * smoothing * growth_rate;
+		  cvector_fft[ThisGrid][index/2].imag *=  green * smoothing * growth_rate;
 		}
 
               if (swap)
 		{
-		  double tmp                          = (cvector_fft[ThisGrid][index/2])[1];
-		  (cvector_fft[ThisGrid][index/2])[1] = (cvector_fft[ThisGrid][index/2])[0];
-		  (cvector_fft[ThisGrid][index/2])[0] = -tmp;
+		  double tmp                          = cvector_fft[ThisGrid][index/2].imag;
+		  cvector_fft[ThisGrid][index/2].imag = cvector_fft[ThisGrid][index/2].real;
+		  cvector_fft[ThisGrid][index/2].real = -tmp;
 		}
 	    }
 	}
@@ -418,7 +469,9 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
     dprintf(VMSG, 0, "[%s] compute_derivative: starting fft\n",fdate());
 
   {
+    
     double time = reverse_transform(ThisGrid);
+    
     
     if (!ThisTask)
       dprintf(VMSG, 0, "[%s] compute_derivative: done fft, cpu time = %f\n",fdate(),time);
@@ -426,18 +479,20 @@ int compute_derivative(int ThisGrid, int first_derivative, int second_derivative
     cputime.fft+=time;
   }
 
-  /* for (int local_x = 0; local_x < MyGrids[ThisGrid].GSlocal[_x_]; local_x++) */
-  /*   for (int local_y = 0; local_y < MyGrids[ThisGrid].GSlocal[_y_]; local_y++) */
-  /*     for (int local_z = 0; local_z < MyGrids[ThisGrid].GSlocal[_z_]; local_z++) */
-  /* 	{ */
-  /* 	  index=local_x + MyGrids[ThisGrid].GSlocal[_x_] * (local_y + local_z * MyGrids[ThisGrid].GSlocal[_y_]); */
-  /* 	  printf(" %3d %3d %3d  %6d  %8f\n",local_x,local_y,local_z,index,rvector_fft[ThisGrid][index]); */
-  /* 	} */
-
+  /*
+  for (int local_x = 0; local_x < MyGrids[ThisGrid].GSlocal[_x_]; local_x++) 
+    for (int local_y = 0; local_y < MyGrids[ThisGrid].GSlocal[_y_]; local_y++) 
+      for (int local_z = 0; local_z < MyGrids[ThisGrid].GSlocal[_z_]; local_z++)
+  	{ 
+   	  int index=local_x + MyGrids[ThisGrid].GSlocal[_x_] * (local_y + local_z * MyGrids[ThisGrid].GSlocal[_y_]); 
+	  printf(" %3d %3d %3d  %6d  %8f\n",local_x,local_y,local_z,index,rvector_fft[ThisGrid][index]); 
+	} 
+  */
   fflush(stdout);
 
   return 0;
 }
+
 
 double greens_function(double *diff_comp, double k_squared, int first_derivative, int second_derivative)
 {
@@ -456,54 +511,38 @@ double greens_function(double *diff_comp, double k_squared, int first_derivative
 
 void write_in_cvector(int ThisGrid, double * restrict vector)
 {
-  dvec * restrict target = (dvec*)cvector_fft[ThisGrid];
-  dvec * restrict source = (dvec*)vector;
-  int mysize = GRID.total_local_size_fft/DVEC_SIZE;
-
-#if !defined(_OPENMP)  
-#pragma GCC ivdep
-#endif
-#ifdef _OPENMP
-#pragma omp for simd schedule(static)
-#endif
-  for ( int i = 0; i < mysize; i++ )
-    *(target + i) = *(source + i);
-
-  for (int i = mysize*DVEC_SIZE; i < GRID.total_local_size_fft; i++ )
-    *((double*)cvector_fft[ThisGrid] + i) = *(vector+i);
-
+  /*
+#pragma omp target use_device_addr(vector, cvector_fft[ThisGrid])
+#pragma omp target teams distribute parallel for
+  */
   // non-vector code   
-  /* for ( i = 0; i < GRID.total_local_size_fft; i++ ) */
-  /*   *((double*)cvector_fft[ThisGrid] + i) = *(vector + i); */
-
+  for ( long int i = 0; i < GRID.total_local_size_fft; i++ )
+    {
+      /*
+      cvector_fft[ThisGrid][i].real = vector[i];
+      cvector_fft[ThisGrid][i].imag = vector[i+1];
+      */
+      *((double*)cvector_fft[ThisGrid] + i) = *(vector+i);
+      //printf("index %ld <-- %f, %f\n", i, cvector_fft[ThisGrid][i].real, cvector_fft[ThisGrid][i].imag);
+    }
+  /*
+  for ( long int i = 0; i < cvector_size; i++)
+    printf("index %ld <-- %f, %f\n", i, cvector_fft[ThisGrid][i].real, cvector_fft[ThisGrid][i].imag);
+  */
 }
-
-
 
 
 void write_from_cvector(int ThisGrid, double * restrict vector)
 {
-  dvec * restrict source = (dvec*)cvector_fft[ThisGrid];
-  dvec * restrict target = (dvec*)vector;
-
-  int mysize = GRID.total_local_size_fft/DVEC_SIZE;
-
-#if !defined(_OPENMP)
-#pragma GCC ivdep
-#endif
-#ifdef _OPENMP
-#pragma omp for simd schedule(static)  
-#endif
-  for ( int i = 0; i < mysize; i++ )
-    *(target + i) = *(source + i);
-
-  for (int i = mysize*DVEC_SIZE; i < GRID.total_local_size_fft; i++ )
-    *(vector + i) = *((double*)cvector_fft[ThisGrid] + i);
-
   // non-vector code   
-  /* for ( i = 0; i < GRID.total_local_size_fft; i++ ) */
-  /*   *(vector + i) = *((double*)cvector_fft[ThisGrid] + i); */
-
+  for ( long int i = 0; i < GRID.total_local_size_fft; i++ )
+    {
+      *(vector + i) = *((double*)cvector_fft[ThisGrid] + i);
+      /*
+      vector[i]   = cvector_fft[ThisGrid][i].real;
+      vector[i+1] = cvector_fft[ThisGrid][i].imag;
+      */
+    }
 }
 
 
@@ -513,7 +552,7 @@ void write_in_rvector(int ThisGrid, double * restrict vector)
   dvec * restrict target = (dvec*)rvector_fft[ThisGrid];
   dvec * restrict source = (dvec*)vector;
   int mysize = GRID.total_local_size / DVEC_SIZE;
-
+  
 #if !defined(_OPENMP)
 #pragma GCC ivdep
 #endif  
@@ -556,7 +595,6 @@ void write_from_rvector(int ThisGrid, double * restrict vector)
   /*   *(vector + i) = *(rvector_fft[ThisGrid] + i); */
 
 }
-
 
 void write_from_rvector_to_products(int ThisGrid, int ia, int order)
 {
@@ -626,6 +664,19 @@ void write_from_rvector_to_products(int ThisGrid, int ia, int order)
       break;
     }
 
+}
+
+
+int store_velocities()
+{
+  /* LUCA: vettorializziamo e ompizziamo? */
+
+  /* loop on all particles */
+  for (int index = 0; index < MyGrids[0].total_local_size; index++)
+    for (int i = 0; i < 3; i++)
+      products[index].Vel[i]=first_derivatives[0][i][index];
+
+  return 0;
 }
 
 

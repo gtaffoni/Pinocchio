@@ -2,25 +2,23 @@
  *                        PINOCCHIO  V5.1                        *
  *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  *
  *****************************************************************
- 
+
  This code was written by
- Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan, 
+ Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan,
  Chiara Moretti, Luca Tornatore, David Goz, Tiago Castro
  Copyright (C) 2025
- 
+
  github: https://github.com/pigimonaco/Pinocchio
  web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html
- 
+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation; either version 2 of the License, or
  (at your option) any later version.
- 
  This program is distributed in the hope that it will be useful,
  but WITHOUT ANY WARRANTY; without even the implied warranty of
  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  GNU General Public License for more details.
- 
  You should have received a copy of the GNU General Public License
  along with this program; if not, write to the Free Software
  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
@@ -31,7 +29,7 @@
 #include "pinocchio.h"
 #include <gsl/gsl_interp2d.h>
 #include <gsl/gsl_spline2d.h>
-#include <immintrin.h>
+//#include <immintrin.h>
 #include <assert.h>
 
 /*------------------------------------------------------- Macros declaration --------------------------------------------------------*/
@@ -113,7 +111,6 @@ FORCE_INLINE void ord(double *const restrict, double *const restrict, double *co
 
 double cputime_ell;
 #pragma omp threadprivate(cputime_ell) // threadprivate directive specifies that variables are replicated, with each thread having its own copy
-
 
 /* It will be use as a fail "flag" indicating that for some reason the calculation of collapse time failed */
 
@@ -522,7 +519,7 @@ int compute_collapse_times(int ismooth)
     }
   
   /* PMT measure */
-//   PMT_CPU_START("collapse_time_CPU");
+  PMT_CPU_START("collapse_time_CPU", ThisTask);
   /* timing the main loop of 'compute_collapse_times' function */
   double cputmp = MPI_Wtime();
   /*-----------------------------------------------------------------------------------*/
@@ -564,13 +561,7 @@ int compute_collapse_times(int ismooth)
     } // target region  
 
   /* ------------- Updates cpu collapse time for a single threads -----------------------------*/
-
-  /* CPU collapse time */	
-  cputime.coll += (MPI_Wtime() - cputmp);
-
-  /* PMT measures */
-//   PMT_CPU_STOP("collapse_time_CPU");
-  
+   
   /* Fail check during computation of the inverse collapse time */
   /* If there were failures, an error message is printed and the function returns 1 */
   if (all_fails)
@@ -579,7 +570,13 @@ int compute_collapse_times(int ismooth)
       fflush(stdout);
       return 1;
     }
-  
+
+  /* CPU collapse time */	
+  cputime.coll += (MPI_Wtime() - cputmp);
+
+  /* PMT measures */
+  PMT_CPU_STOP("collapse_time_CPU", ThisTask);
+    
   /* Calculating obtained variance and avarage */		
   double global_variance = 0.0;
   double global_average  = 0.0;

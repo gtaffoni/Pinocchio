@@ -75,8 +75,19 @@ smoothing_data Smoothing;
 grid_data *MyGrids;
 int Ngrids;
 
-pfft_complex **cvector_fft;
+/* Declare the new cvector structure */
+struct my_double_complex **cvector_fft;
+long int cvector_size;
+
 double **rvector_fft;
+
+int devID; /* Probably needed */
+
+/* Structure containing informations about heffte options */
+heffte_plan_options options_fft;
+
+/* define inbox and outbox to be initialized in set_one_grid(ThisGrid) function */
+int inbox_low[3], inbox_high[3], outbox_low[3], outbox_high[3];
 
 param_data params={0};
 output_data outputs;

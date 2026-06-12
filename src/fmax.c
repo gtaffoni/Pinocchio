@@ -2,25 +2,23 @@
  *                        PINOCCHIO  V5.1                        *
  *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  *
  *****************************************************************
- 
+
  This code was written by
- Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan, 
+ Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan,
  Chiara Moretti, Luca Tornatore, David Goz, Tiago Castro
  Copyright (C) 2025
- 
+
  github: https://github.com/pigimonaco/Pinocchio
  web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html
- 
+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation; either version 2 of the License, or
  (at your option) any later version.
- 
  This program is distributed in the hope that it will be useful,
  but WITHOUT ANY WARRANTY; without even the implied warranty of
  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  GNU General Public License for more details.
- 
  You should have received a copy of the GNU General Public License
  along with this program; if not, write to the Free Software
  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
@@ -31,19 +29,18 @@
 int compute_second_derivatives(double, int);
 int Fmax_PDF(void);
 
-
 /* Computation of collapse times and displacements */
 int compute_fmax(void)
 {
-  int ismooth,ThisGrid;
-  double cputmp,cpusm;
+  int ismooth, ThisGrid;
+  double cputmp, cpusm;
 
-  cputime.fmax=MPI_Wtime();
+  cputime.fmax = MPI_Wtime();
 
   if (!ThisTask)
-    printf("[%s] First part: computation of collapse times\n",fdate());
+    printf("[%s] First part: computation of collapse times\n", fdate());
 
-  ThisGrid=0;
+  ThisGrid = 0;
 
   /*
     TO EXTEND TO MULTIPLE GRIDS here we should
@@ -55,50 +52,49 @@ int compute_fmax(void)
     5) re-initialize fft for the small-scale grid
   */
 
-  ScaleDep.order=0; /* collapse times must be computed as for LambdaCDM */
-  ScaleDep.redshift=0.0;
-
+  ScaleDep.order = 0; /* collapse times must be computed as for LambdaCDM */
+  ScaleDep.redshift = 0.0;
 
   /****************************
    * CYCLE ON SMOOTHING RADII *
    ****************************/
 
-  for (ismooth=0; ismooth<Smoothing.Nsmooth; ismooth++)
-    {
-      if (!ThisTask)
-	printf("\n[%s] Starting smoothing radius %d of %d (R=%9.5f, sigma=%9.5f)\n", 
-	       fdate(), ismooth+1, Smoothing.Nsmooth, Smoothing.Radius[ismooth],
-	       sqrt(Smoothing.Variance[ismooth]) );
+  for (ismooth = 0; ismooth < Smoothing.Nsmooth; ismooth++)
+  {
+    if (!ThisTask)
+      printf("\n[%s] Starting smoothing radius %d of %d (R=%9.5f, sigma=%9.5f)\n",
+             fdate(), ismooth + 1, Smoothing.Nsmooth, Smoothing.Radius[ismooth],
+             sqrt(Smoothing.Variance[ismooth]));
 
-      cpusm=MPI_Wtime();
+    cpusm = MPI_Wtime();
 
-      /* 
-	 Part 1:
-	 Compute second derivatives of the potential
-      */
+    /*
+ Part 1:
+ Compute second derivatives of the potential
+    */
 
-      if (!ThisTask)
-	printf("[%s] Computing second derivatives\n",fdate());
+    if (!ThisTask)
+      printf("[%s] Computing second derivatives\n", fdate());
 
-      cputmp=MPI_Wtime();
+    cputmp = MPI_Wtime();
 
-      if (compute_second_derivatives(Smoothing.Radius[ismooth] ,ThisGrid))
-	return 1;
+    if (compute_second_derivatives(Smoothing.Radius[ismooth], ThisGrid))
+      return 1;
 
-      cputmp=MPI_Wtime()-cputmp;
-      if (!ThisTask)
-	printf("[%s] Done second derivatives, cpu time = %f s\n",fdate(),cputmp);
-      cputime.deriv += cputmp;
+    cputmp = MPI_Wtime() - cputmp;
+    if (!ThisTask)
+      printf("[%s] Done second derivatives, cpu time = %f s\n", fdate(), cputmp);
+    cputime.deriv += cputmp;
 
-      /* 
-	 Part 2:
-	 Compute collapse times
-      */
+    /*
+ Part 2:
+ Compute collapse times
+    */
 
-      if (!ThisTask)
-	printf("[%s] Computing collapse times\n",fdate());
+    if (!ThisTask)
+      printf("[%s] Computing collapse times\n", fdate());
 
-      cputmp=MPI_Wtime();
+    cputmp = MPI_Wtime();
 
 #ifdef TABULATED_CT
       /* initialize spline for interpolating collapse times */
@@ -114,7 +110,7 @@ int compute_fmax(void)
 	}
 #endif // TABULATED_CT
 
-      if (
+    if (
 #if defined(GPU_OMP) || defined(GPU_OMP_FULL)
 	  compute_collapse_times_gpu(ismooth)
 #else
@@ -125,35 +121,33 @@ int compute_fmax(void)
 	return 1;
 
 #ifdef TABULATED_CT
-      /* this is needed only for debug options, to be removed in the official code */
-      if (reset_collapse_times(ismooth))
-	return 1;
-#endif // TABULATED_CT
+    /* this is needed only for debug options, to be removed in the official code */
+    if (reset_collapse_times(ismooth))
+      return 1;
+#endif
 
-      // cputmp=MPI_Wtime()-cputmp;
-      if (!ThisTask)
-	printf("[%s] Done computing collapse times, cpu time = %f s\n",fdate(),cputmp);
-      // cputime.coll+=cputmp;
+    // cputmp = MPI_Wtime() - cputmp;
+    if (!ThisTask)
+      printf("[%s] Done computing collapse times, cpu time = %f s\n", fdate(), cputmp);
+    // cputime.coll += cputmp;
 
-      /*
-	End of cycle on smoothing radii
-      */
+    /*
+End of cycle on smoothing radii
+    */
 
-      cpusm = MPI_Wtime()-cpusm;
+    cpusm = MPI_Wtime() - cpusm;
 
-      if (!ThisTask)
-	printf("[%s] Completed, R=%6.3f, expected sigma: %7.4f, computed sigma: %7.4f, cpu time = %f s\n",fdate(),
-	       Smoothing.Radius[ismooth], sqrt(Smoothing.Variance[ismooth]), 
-	       sqrt(Smoothing.TrueVariance[ismooth]), 
-	       cpusm );
+    if (!ThisTask)
+      printf("[%s] Completed, R=%6.3f, expected sigma: %7.4f, computed sigma: %7.4f, cpu time = %f s\n", fdate(),
+             Smoothing.Radius[ismooth], sqrt(Smoothing.Variance[ismooth]),
+             sqrt(Smoothing.TrueVariance[ismooth]),
+             cpusm);
 
-      fflush(stdout);
-      MPI_Barrier(MPI_COMM_WORLD);
-    }
+    fflush(stdout);
+    MPI_Barrier(MPI_COMM_WORLD);
+  }
 
-
-
-#if defined(CUSTOM_INTERPOLATION) || defined(GPU_OMP) 
+  #if defined(CUSTOM_INTERPOLATION) || defined(GPU_OMP) 
   custom_cubic_spline_free(host_spline);
 
 #endif // defined(CUSTOM_INTERPOLATION) || defined(GPU_OMP)
@@ -260,20 +254,20 @@ int compute_fmax(void)
    * COMPUTATION OF DISPLACEMENTS *
    ********************************/
 
-  /* computes the displacements for all particles at zero smoothing, 
-     assuming second derivatives are already in place 
+  /* computes the displacements for all particles at zero smoothing,
+     assuming second derivatives are already in place
      displacements are computed to the redshift of the first (or only) segment
   */
-  cputmp=MPI_Wtime();
+  cputmp = MPI_Wtime();
   if (!ThisTask)
-    printf("\n[%s] Computing displacements  for redshift %f\n",fdate(),ScaleDep.z[0]);
+    printf("\n[%s] Computing displacements  for redshift %f\n", fdate(), ScaleDep.z[0]);
 
-  if (compute_displacements(1,0,ScaleDep.z[0]))
+  if (compute_displacements(1, 0, ScaleDep.z[0]))
     return 1;
 
-  cputmp=MPI_Wtime()-cputmp;
+  cputmp = MPI_Wtime() - cputmp;
   if (!ThisTask)
-    printf("[%s] Done computing displacements, cpu time = %f s\n",fdate(),cputmp);
+    printf("[%s] Done computing displacements, cpu time = %f s\n", fdate(), cputmp);
 
   /***************/
   /* END OF FMAX */
@@ -288,10 +282,10 @@ int compute_fmax(void)
   cputime.fmax = MPI_Wtime() - cputime.fmax;
   if (!ThisTask)
     printf("[%s] Finishing fmax, total fmax cpu time = %14.6f\n"
-	   "\t\t IO       : %14.6f (%14.6f total time without I/O)\n"
-	   "\t\t FFT      : %14.6f\n"
-	   "\t\t COLLAPSE : %14.6f\n",
-	   fdate(), cputime.fmax, cputime.io, cputime.fmax-cputime.io, cputime.fft, cputime.coll);
+           "\t\t IO       : %14.6f (%14.6f total time without I/O)\n"
+           "\t\t FFT      : %14.6f\n"
+           "\t\t COLLAPSE : %14.6f\n",
+           fdate(), cputime.fmax, cputime.io, cputime.fmax - cputime.io, cputime.fft, cputime.coll);
 
   return 0;
 }
@@ -327,7 +321,6 @@ int compute_first_derivatives(double R, int ThisGrid, int order, double* vector)
   cputime.mem_transf += timetmp;
   return 0;
 }
-
 
 int compute_second_derivatives(double R, int ThisGrid)
 {
@@ -365,7 +358,6 @@ int compute_second_derivatives(double R, int ThisGrid)
   return 0;
 }
 
-
 char *fdate()
 {
   /* returns a 24-char string with the full date and time
@@ -378,24 +370,23 @@ char *fdate()
   /* format from ctime:
     0123456789
               0123456789
-	                0123
+                  0123
     Www Mmm dd hh:mm:ss yyyy
   */
 
-  current_time=time(NULL);
-  string=ctime(&current_time);
+  current_time = time(NULL);
+  string = ctime(&current_time);
 
-  for (n=0; n<10; n++)
-    *(date_string+n)=*(string+n);
-  for (n=10; n<15; n++)
-    *(date_string+n)=*(string+n+9);
-  for (n=10; n<19; n++)
-    *(date_string+n+5)=*(string+n);
-  *(date_string+24)='\0';
+  for (n = 0; n < 10; n++)
+    *(date_string + n) = *(string + n);
+  for (n = 10; n < 15; n++)
+    *(date_string + n) = *(string + n + 9);
+  for (n = 10; n < 19; n++)
+    *(date_string + n + 5) = *(string + n);
+  *(date_string + 24) = '\0';
 
   return date_string;
 }
-
 
 int compute_displacements(int compute_sources, int recompute_sd, double redshift)
 {
@@ -407,56 +398,56 @@ int compute_displacements(int compute_sources, int recompute_sd, double redshift
 #ifdef TWO_LPT
 
   if (recompute_sd)
-    {
-      /* second derivatives are needed for LPT displacements, if not already in place they must be recomputed */
-      cputmp=MPI_Wtime();
-      if (!ThisTask)
-	printf("\n[%s] Computing second derivatives\n",fdate());
+  {
+    /* second derivatives are needed for LPT displacements, if not already in place they must be recomputed */
+    cputmp = MPI_Wtime();
+    if (!ThisTask)
+      printf("\n[%s] Computing second derivatives\n", fdate());
 
-      ScaleDep.order=0;  /* sources are computed as for LambdaCDM at z=0 */
-      ScaleDep.redshift=0.0;
+    ScaleDep.order = 0; /* sources are computed as for LambdaCDM at z=0 */
+    ScaleDep.redshift = 0.0;
 
-      if (compute_second_derivatives(0.0, 0))
-	return 1;
+    if (compute_second_derivatives(0.0, 0))
+      return 1;
 
-      cputmp=MPI_Wtime()-cputmp;
-      if (!ThisTask)
-	printf("[%s] Done second derivatives, cpu time = %f s\n",fdate(),cputmp);
-      cputime.deriv+=cputmp;
-    }
+    cputmp = MPI_Wtime() - cputmp;
+    if (!ThisTask)
+      printf("[%s] Done second derivatives, cpu time = %f s\n", fdate(), cputmp);
+    cputime.deriv += cputmp;
+  }
 
   /* computes the 2LPT and 3LPT displacement fields and stores them in the products */
-  cputmp=MPI_Wtime();
+  cputmp = MPI_Wtime();
   if (!ThisTask)
-    printf("\n[%s] Computing LPT displacements\n",fdate());
+    printf("\n[%s] Computing LPT displacements\n", fdate());
 
   if (compute_LPT_displacements(compute_sources, redshift))
     return 1;
 
-  cputmp=MPI_Wtime()-cputmp;
+  cputmp = MPI_Wtime() - cputmp;
   if (!ThisTask)
-    printf("[%s] Done LPT displacements, cpu time = %f s\n",fdate(),cputmp);
-  cputime.lpt+=cputmp;
+    printf("[%s] Done LPT displacements, cpu time = %f s\n", fdate(), cputmp);
+  cputime.lpt += cputmp;
 
 #endif
 
   /* computes Zeldovich displacements */
-  cputmp=MPI_Wtime();
+  cputmp = MPI_Wtime();
   if (!ThisTask)
-    printf("[%s] Computing first derivatives\n",fdate());
+    printf("[%s] Computing first derivatives\n", fdate());
 
-  /* for scale-dependent growth we compute the displacements for the first redshift segment 
+  /* for scale-dependent growth we compute the displacements for the first redshift segment
      in case there is only one segment, this implies to compute them at the final redshift */
-  ScaleDep.redshift=redshift;
-  ScaleDep.order=1;   /* here we need the first-order growth */
+  ScaleDep.redshift = redshift;
+  ScaleDep.order = 1; /* here we need the first-order growth */
 
   if (compute_first_derivatives(0.0, 0, 1, kdensity[0]))
     return 1;
 
-  cputmp=MPI_Wtime()-cputmp;
+  cputmp = MPI_Wtime() - cputmp;
   if (!ThisTask)
-    printf("[%s] Done first derivatives, cpu time = %f s\n",fdate(),cputmp);
-  cputime.deriv+=cputmp;
+    printf("[%s] Done first derivatives, cpu time = %f s\n", fdate(), cputmp);
+  cputime.deriv += cputmp;
 
   /* /\* Store Zeldovich displacements in the products *\/ */
   /* cputmp=MPI_Wtime(); */
@@ -474,6 +465,59 @@ int compute_displacements(int compute_sources, int recompute_sd, double redshift
   return 0;
 }
 
+/*
+ * Fast-path displacement update for scale-independent growth.
+ * Assumes RECOMPUTE_DISPLACEMENTS workflow has already shifted current->prev
+ * via shift_all_displacements(); this function then updates the "current"
+ * per-particle displacements by scaling from z_prev to z_curr with the
+ * appropriate k-independent growth factors (1LPT, 2LPT, 3LPT components).
+ */
+int scale_products_displacements(double z_prev, double z_curr)
+{
+  /* Guard: if the two redshifts are equal, nothing to do */
+  if (z_prev == z_curr)
+    return 0;
+
+  /* Growth ratios for LambdaCDM / scale-independent case */
+  const double r1 = GrowingMode(z_curr, 0.0) / GrowingMode(z_prev, 0.0);
+#ifdef TWO_LPT
+  const double r2 = GrowingMode_2LPT(z_curr, 0.0) / GrowingMode_2LPT(z_prev, 0.0);
+#ifdef THREE_LPT
+  const double r31 = GrowingMode_3LPT_1(z_curr, 0.0) / GrowingMode_3LPT_1(z_prev, 0.0);
+  const double r32 = GrowingMode_3LPT_2(z_curr, 0.0) / GrowingMode_3LPT_2(z_prev, 0.0);
+#endif
+#endif
+
+  double timetmp = MPI_Wtime();
+  /* Scale current displacements in place; previous displacements are left
+     as-is (already containing the z_prev values after shift_all_displacements) */
+#pragma omp parallel for schedule(static)
+  for (long long idx = 0; idx < MyGrids[0].total_local_size; ++idx)
+  {
+    products[idx].Vel[0] *= r1;
+    products[idx].Vel[1] *= r1;
+    products[idx].Vel[2] *= r1;
+#ifdef TWO_LPT
+    products[idx].Vel_2LPT[0] *= r2;
+    products[idx].Vel_2LPT[1] *= r2;
+    products[idx].Vel_2LPT[2] *= r2;
+#ifdef THREE_LPT
+    products[idx].Vel_3LPT_1[0] *= r31;
+    products[idx].Vel_3LPT_1[1] *= r31;
+    products[idx].Vel_3LPT_1[2] *= r31;
+    products[idx].Vel_3LPT_2[0] *= r32;
+    products[idx].Vel_3LPT_2[1] *= r32;
+    products[idx].Vel_3LPT_2[2] *= r32;
+#endif
+#endif
+  }
+
+  timetmp = MPI_Wtime() - timetmp;
+  cputime.mem_transf += timetmp;
+  if (!ThisTask)
+    printf("[%s] Scaled displacements from z=%g to z=%g, cpu time = %f s\n", fdate(), z_prev, z_curr, timetmp);
+  return 0;
+}
 
 #include <sys/stat.h>
 
@@ -485,46 +529,46 @@ int dump_products()
   FILE *file;
   char fname[LBLENGTH];
 
-  /* Task 0 checks that the DumpProducts directory exists, or creates it 
+  /* Task 0 checks that the DumpProducts directory exists, or creates it
      and writes a summary file to check that one does not start from a different run */
   if (!ThisTask)
+  {
+    if (stat(params.DumpDir, &dr))
     {
-      if(stat(params.DumpDir,&dr))
-	  {
-	    printf("Creating directory %s\n",params.DumpDir);
-	    if (mkdir(params.DumpDir,0755))
-	      {
-		printf("ERROR IN CREATING DIRECTORY %s (task 0)\n",params.DumpDir);
-		return 1;
-	      }
-	  }
-
-      sprintf(fname,"%ssummary",params.DumpDir);
-      file=fopen(fname,"w");
-      fprintf(file,"%d   # NTasks\n",NTasks);
-      fprintf(file,"%d   # random seed\n",params.RandomSeed);
-      fprintf(file,"%d   # grid size\n",params.GridSize[0]);
-      fprintf(file,"%d   # length of product_data\n",(int)sizeof(product_data));
-      fclose(file);
-
-      /* dumps the true variances */
-      sprintf(fname,"%sTrueVariance",params.DumpDir);
-      file=fopen(fname,"wb");
-      fwrite(Smoothing.TrueVariance, sizeof(double), Smoothing.Nsmooth, file);
-      fclose(file);
+      printf("Creating directory %s\n", params.DumpDir);
+      if (mkdir(params.DumpDir, 0755))
+      {
+        printf("ERROR IN CREATING DIRECTORY %s (task 0)\n", params.DumpDir);
+        return 1;
+      }
     }
+
+    sprintf(fname, "%ssummary", params.DumpDir);
+    file = fopen(fname, "w");
+    fprintf(file, "%d   # NTasks\n", NTasks);
+    fprintf(file, "%d   # random seed\n", params.RandomSeed);
+    fprintf(file, "%d   # grid size\n", params.GridSize[0]);
+    fprintf(file, "%d   # length of product_data\n", (int)sizeof(product_data));
+    fclose(file);
+
+    /* dumps the true variances */
+    sprintf(fname, "%sTrueVariance", params.DumpDir);
+    file = fopen(fname, "wb");
+    fwrite(Smoothing.TrueVariance, sizeof(double), Smoothing.Nsmooth, file);
+    fclose(file);
+  }
 
   /* all tasks must wait for Task 0 to open the directory (if needed) */
   MPI_Barrier(MPI_COMM_WORLD);
 
   /* each task writes a separate dump file */
-  sprintf(fname,"%sTask.%d",params.DumpDir,ThisTask);
-  file=fopen(fname,"wb");
-  if (file==0x0)
-    {
-      printf("ERROR on Task %d: could not open file %s\n",ThisTask, fname);
-      return 1;
-    }
+  sprintf(fname, "%sTask.%d", params.DumpDir, ThisTask);
+  file = fopen(fname, "wb");
+  if (file == 0x0)
+  {
+    printf("ERROR on Task %d: could not open file %s\n", ThisTask, fname);
+    return 1;
+  }
 
   // NOTE: with LEAPFROG one needs to swap also kdensity and kvectors
   fwrite(products, sizeof(product_data), MyGrids[0].total_local_size, file);
@@ -533,78 +577,77 @@ int dump_products()
   return 0;
 }
 
-
 int read_dumps()
 {
   /* reads in fmax products from files */
   FILE *file;
-  char fname[LBLENGTH],buf[SBLENGTH];
+  char fname[LBLENGTH], buf[SBLENGTH];
   int myNTasks, myRandomSeed, myGridSize, myPDlength;
 
   /* Task 0 checks that the DumpProducts/summary exists and is compatible with the present run */
   if (!ThisTask)
-    {
-      sprintf(fname,"%ssummary",params.DumpDir);
-      file=fopen(fname,"r");
-      (void)fgets(buf, SBLENGTH, file);
-      sscanf(buf,"%d",&myNTasks);
-      (void)fgets(buf, SBLENGTH, file);
-      sscanf(buf,"%d",&myRandomSeed);
-      (void)fgets(buf, SBLENGTH, file);
-      sscanf(buf,"%d",&myGridSize);
-      (void)fgets(buf, SBLENGTH, file);
-      sscanf(buf,"%d",&myPDlength);
-      fclose(file);
-      
-      int error=0;
-      if (NTasks != myNTasks)
-	{
-	  printf("ERROR: the number of tasks in %s does not match - %d vs %d\n",
-		 fname, myNTasks, NTasks);
-	  error++;
-	}
-      if (params.RandomSeed != myRandomSeed)
-	{
-	  printf("ERROR: the random seed in %s does not match - %d vs %d\n",
-		 fname, myRandomSeed, params.RandomSeed);
-	  error++;
-	}
-      if (params.GridSize[0] != myGridSize)
-	{
-	  printf("ERROR: the grid size in %s does not match - %d vs %d\n",
-		 fname, myGridSize, params.GridSize[0]);
-	  error++;
-	}
-      if (myPDlength != (int)sizeof(product_data))
-	{
-	  printf("ERROR: the length of product_data in %s does not match - %d vs %d\n",
-		 fname, myPDlength, (int)sizeof(product_data));
-	  error++;
-	}
-      if (error)
-	return 1;
+  {
+    sprintf(fname, "%ssummary", params.DumpDir);
+    file = fopen(fname, "r");
+    (void)fgets(buf, SBLENGTH, file);
+    sscanf(buf, "%d", &myNTasks);
+    (void)fgets(buf, SBLENGTH, file);
+    sscanf(buf, "%d", &myRandomSeed);
+    (void)fgets(buf, SBLENGTH, file);
+    sscanf(buf, "%d", &myGridSize);
+    (void)fgets(buf, SBLENGTH, file);
+    sscanf(buf, "%d", &myPDlength);
+    fclose(file);
 
-      /* reads and broadcasts true variances */
-      sprintf(fname,"%sTrueVariance",params.DumpDir);
-      file=fopen(fname,"rb");
-      if (file==0x0)
-	{
-	  printf("ERROR on Task 0: could not open file %s\n",fname);
-	  return 1;
-	}
-      fread(Smoothing.TrueVariance, sizeof(double), Smoothing.Nsmooth, file);
-      fclose(file);
-    }
-  MPI_Bcast(Smoothing.TrueVariance, Smoothing.Nsmooth, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-  
-  /* each task reads a separate dump file */
-  sprintf(fname,"%sTask.%d",params.DumpDir,ThisTask);
-  file=fopen(fname,"rb");
-  if (file==0x0)
+    int error = 0;
+    if (NTasks != myNTasks)
     {
-      printf("ERROR on Task %d: could not open file %s\n",ThisTask, fname);
+      printf("ERROR: the number of tasks in %s does not match - %d vs %d\n",
+             fname, myNTasks, NTasks);
+      error++;
+    }
+    if (params.RandomSeed != myRandomSeed)
+    {
+      printf("ERROR: the random seed in %s does not match - %d vs %d\n",
+             fname, myRandomSeed, params.RandomSeed);
+      error++;
+    }
+    if (params.GridSize[0] != myGridSize)
+    {
+      printf("ERROR: the grid size in %s does not match - %d vs %d\n",
+             fname, myGridSize, params.GridSize[0]);
+      error++;
+    }
+    if (myPDlength != (int)sizeof(product_data))
+    {
+      printf("ERROR: the length of product_data in %s does not match - %d vs %d\n",
+             fname, myPDlength, (int)sizeof(product_data));
+      error++;
+    }
+    if (error)
+      return 1;
+
+    /* reads and broadcasts true variances */
+    sprintf(fname, "%sTrueVariance", params.DumpDir);
+    file = fopen(fname, "rb");
+    if (file == 0x0)
+    {
+      printf("ERROR on Task 0: could not open file %s\n", fname);
       return 1;
     }
+    fread(Smoothing.TrueVariance, sizeof(double), Smoothing.Nsmooth, file);
+    fclose(file);
+  }
+  MPI_Bcast(Smoothing.TrueVariance, Smoothing.Nsmooth, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+  /* each task reads a separate dump file */
+  sprintf(fname, "%sTask.%d", params.DumpDir, ThisTask);
+  file = fopen(fname, "rb");
+  if (file == 0x0)
+  {
+    printf("ERROR on Task %d: could not open file %s\n", ThisTask, fname);
+    return 1;
+  }
 
   // NOTE: with LEAPFROG one needs to read in also kdensity and kvectors
   fread(products, sizeof(product_data), MyGrids[0].total_local_size, file);
@@ -613,46 +656,45 @@ int read_dumps()
   return 0;
 }
 
-
 int Fmax_PDF(void)
 {
 
   unsigned long long my_counter[NBINS], counter[NBINS], coll;
 
-  for (int i=0; i<NBINS; i++)
-    my_counter[i]=0;
+  for (int i = 0; i < NBINS; i++)
+    my_counter[i] = 0;
 
-  for (int i=0; i<MyGrids[0].total_local_size; i++)
-    {
-      int xF = (int)(products[i].Fmax*10.);
-      if (xF<0)
-	xF=0;
-      if (xF>=NBINS)
-	xF=NBINS-1;
-      my_counter[xF]++;
-    }
+  for (int i = 0; i < MyGrids[0].total_local_size; i++)
+  {
+    int xF = (int)(products[i].Fmax * 10.);
+    if (xF < 0)
+      xF = 0;
+    if (xF >= NBINS)
+      xF = NBINS - 1;
+    my_counter[xF]++;
+  }
 
   MPI_Reduce(my_counter, counter, NBINS, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
   if (!ThisTask)
-    {
-      coll=0;
-      for (int i=10; i<NBINS; i++)
-	coll+=counter[i];
-      printf("[%s] Number of collapsed particles to z=0: %Lu\n",fdate(),coll);
+  {
+    coll = 0;
+    for (int i = 10; i < NBINS; i++)
+      coll += counter[i];
+    printf("[%s] Number of collapsed particles to z=0: %Lu\n", fdate(), coll);
 
-      char filename[LBLENGTH];
-      sprintf(filename,"pinocchio.%s.FmaxPDF.out",params.RunFlag);
-      FILE *file=fopen(filename,"w");
-      fprintf(file, "# Fmax PDF over %Lu particles\n",MyGrids[0].Ntotal);
-      fprintf(file, "# 1-2: F interval\n");
-      fprintf(file, "# 3: number of particles in that interval\n");
-      fprintf(file, "#\n");
-      for (int i=0; i<NBINS; i++)
-	fprintf(file, " %6.1f   %6.1f  %Lu\n",(double)i/10., 
-		(i==NBINS-1? 999.0 : (double)(i+1)/10.), counter[i]);
-      fclose(file);
-    }
+    char filename[LBLENGTH];
+    sprintf(filename, "pinocchio.%s.FmaxPDF.out", params.RunFlag);
+    FILE *file = fopen(filename, "w");
+    fprintf(file, "# Fmax PDF over %Lu particles\n", MyGrids[0].Ntotal);
+    fprintf(file, "# 1-2: F interval\n");
+    fprintf(file, "# 3: number of particles in that interval\n");
+    fprintf(file, "#\n");
+    for (int i = 0; i < NBINS; i++)
+      fprintf(file, " %6.1f   %6.1f  %Lu\n", (double)i / 10.,
+              (i == NBINS - 1 ? 999.0 : (double)(i + 1) / 10.), counter[i]);
+    fclose(file);
+  }
 
   return 0;
 }

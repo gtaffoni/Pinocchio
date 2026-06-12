@@ -2,25 +2,23 @@
  *                        PINOCCHIO  V5.1                        *
  *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  *
  *****************************************************************
- 
+
  This code was written by
- Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan, 
+ Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan,
  Chiara Moretti, Luca Tornatore, David Goz, Tiago Castro
  Copyright (C) 2025
- 
+
  github: https://github.com/pigimonaco/Pinocchio
  web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html
- 
+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation; either version 2 of the License, or
  (at your option) any later version.
- 
  This program is distributed in the hope that it will be useful,
  but WITHOUT ANY WARRANTY; without even the implied warranty of
  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  GNU General Public License for more details.
- 
  You should have received a copy of the GNU General Public License
  along with this program; if not, write to the Free Software
  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
@@ -44,12 +42,16 @@
 #include <gsl/gsl_integration.h>
 #include <gsl/gsl_odeiv2.h>
 #include <gsl/gsl_spline.h>
-#include <fftw3-mpi.h>
-#include <pfft.h>
+#include <gsl/gsl_spline2d.h>
+//#include <pfft.h> //Decide whether to keep it or to get rid of it
 #include <assert.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+/* Include HeFFTe */
+//############################
+#include <heffte.h>
+//############################
 
 #ifdef _OPENMP
    #include <omp.h>
@@ -59,6 +61,19 @@
 #endif // _OPENMP
 #ifdef USE_GPERFTOOLS
 #include <gperftools/profiler.h>
+#endif
+
+/* If you want to activate multi-threading for HeFFTe */
+#if defined(_OPENMP) && !defined(GPU_OMP_FULL)
+#include <fftw3.h>
+#endif
+
+
+/* Choose your backend, modify it if you're using non-NVIDIA GPUs */
+#if defined GPU_OMP_FULL
+#define BACKEND Heffte_BACKEND_CUFFT
+#else
+#define BACKEND Heffte_BACKEND_FFTW
 #endif
 
 #ifdef GPU_OMP
@@ -82,10 +97,7 @@
 #endif // defined(CUSTOM_INTERPOLATION) || defined(GPU_OMP) || defined(FULL_GPU_OMP)
 
 // header for PMT library
-#if defined(GPU_OMP) || defined(GPU_OMP_FULL)
-#define _NVIDIA_
-#endif
-#include "energy_parallel/energy_pmt.h"
+#include "energy/energy_pmt.h"
 
 /* this library is used to vectorize the computation of collapse times */
 /* #if !(defined(__aarch64__) || defined(__arm__)) */
@@ -116,33 +128,38 @@
 #define ORDER_FOR_GROUPS 2
 #define ORDER_FOR_CATALOG 3
 
-#define ALIGN 32     /* for memory alignment */
-#define UINTLEN 32   /* 8*sizeof(unsigned int) */
+#define ALIGN 32   /* for memory alignment */
+#define UINTLEN 32 /* 8*sizeof(unsigned int) */
 
-//#define ADD_RMAX_TO_SNAPSHOT
+// #define ADD_RMAX_TO_SNAPSHOT
 
 /* these templates define how to pass from coordinates to indices */
-#define INDEX_TO_COORD(I,X,Y,Z,L) ({Z=(I)%L[_z_]; int _KK_=(I)/L[_z_]; Y=_KK_%L[_y_]; X=_KK_/L[_y_];})
-#define COORD_TO_INDEX(X,Y,Z,L) ((Z) + L[_z_]*((Y) + L[_y_]*(X)))
+#define INDEX_TO_COORD(I, X, Y, Z, L) ({(Z) = (I) % (L)[_z_]; int _KK_ = (I) / (L)[_z_]; (Y) = _KK_ % (L)[_y_]; (X) = _KK_ / (L)[_y_]; })
+#define COORD_TO_INDEX(X, Y, Z, L) ((Z) + (L)[_z_] * ((Y) + (L)[_y_] * (X)))
 
 /* coordinates */
 #define _x_ 0
 #define _y_ 1
 #define _z_ 2
 
-#define DECOMPOSITION_LIMIT_FACTOR_2D 1    /* smallest allowed side lenght of rectangular pencils in */
-                                           /* 2D decomposition of FFT */
+#define DECOMPOSITION_LIMIT_FACTOR_2D 1 /* smallest allowed side lenght of rectangular pencils in */
+                                        /* 2D decomposition of FFT */
 
 /* debug levels */
-#define dprintf(LEVEL, TASK, ...) do{if( ((LEVEL) <= internal.verbose_level) && (ThisTask == (TASK))) fprintf(stdout, __VA_ARGS__);} while(1 == 0)
-#define VDBG  4   // verbose level for debug
-#define VDIAG 2   // verbose level for diagnostics
-#define VMSG  1   // verbose level for flow messages
-#define VXX   0   // essential messages
-#define VERR  VXX // non letal errors
-#define VXERR -1  // letal errors
+#define dprintf(LEVEL, TASK, ...)                                    \
+  do                                                                 \
+  {                                                                  \
+    if (((LEVEL) <= internal.verbose_level) && (ThisTask == (TASK))) \
+      fprintf(stdout, __VA_ARGS__);                                  \
+  } while (1 == 0)
+#define VDBG 4   // verbose level for debug
+#define VDIAG 2  // verbose level for diagnostics
+#define VMSG 1   // verbose level for flow messages
+#define VXX 0    // essential messages
+#define VERR VXX // non letal errors
+#define VXERR -1 // letal errors
 
-#define SWAP_INT( A, B ) (A) ^= (B), (B) ^= (A), (A) ^= (B);
+#define SWAP_INT(A, B) (A) ^= (B), (B) ^= (A), (A) ^= (B);
 
 /* checks of compiler flags */
 #if defined(THREE_LPT) && !defined(TWO_LPT)
@@ -169,27 +186,31 @@
 #warning "You have correctly compiled the code for the modified gravity scenario. However, please keep in mind that the modified gravity run (MOD_GRAV_FR) is still under development, and this mode should be used with extreme caution as it may not be fully stable. If you are unsure about its usage, please contact the developers for guidance."
 #endif
 
+/* Feature gating and sanity checks for Past Light Cone mass maps */
+#if defined(MASS_MAPS_FILTER_UNCOLLAPSED) && !defined(SNAPSHOT)
+#error "MASS_MAPS_FILTER_UNCOLLAPSED requires SNAPSHOT to provide per-particle collapse redshift (ZACC). Enable SNAPSHOT or disable MASS_MAPS_FILTER_UNCOLLAPSED."
+#endif
+
 /* vectorialization */
 #define DVEC_SIZE 4
 
-typedef double dvec __attribute__ ((vector_size (DVEC_SIZE*sizeof(double))));
-typedef long int ivec __attribute__ ((vector_size (DVEC_SIZE*sizeof(long int))));
+typedef double dvec __attribute__((vector_size(DVEC_SIZE * sizeof(double))));
+typedef long int ivec __attribute__((vector_size(DVEC_SIZE * sizeof(long int))));
 
 typedef union
 {
-  dvec   V;
+  dvec V;
   double v[DVEC_SIZE];
 } dvec_u;
 
 typedef union
 {
   ivec V;
-  int  v[DVEC_SIZE];
+  int v[DVEC_SIZE];
 } ivec_u;
 
-
 /* variables and type definitions */
-extern int ThisTask,NTasks;
+extern int ThisTask, NTasks;
 /* pfft-related variables */
 /* extern int pfft_flags_c2r, pfft_flags_r2c; */
 extern MPI_Comm FFT_Comm;
@@ -375,13 +396,13 @@ extern gsl_spline ***CT_Spline;
 extern double *kvector_2LPT;
 extern double *source_2LPT;
 #ifdef THREE_LPT
-extern double *kvector_3LPT_1,*kvector_3LPT_2;
-extern double *source_3LPT_1,*source_3LPT_2;
+extern double *kvector_3LPT_1, *kvector_3LPT_2;
+extern double *source_3LPT_1, *source_3LPT_2;
 #endif
 #endif
 
 extern double Rsmooth;
-typedef struct 
+typedef struct
 {
   int Nsmooth;
   double *Radius, *Variance, *TrueVariance;
@@ -405,38 +426,57 @@ typedef struct
   ptrdiff_t          GSlocal_k[3];
   ptrdiff_t          GSstart_k[3];
   double             lower_k_cutoff, upper_k_cutoff, norm, BoxSize, CellSize;
-  pfft_plan          forward_plan, reverse_plan;
+  heffte_plan          plan;
   unsigned long long Ntotal;
 } grid_data;
 extern grid_data *MyGrids;
 
+/* DEFINE MY COMPLEX STRUCTURE FOR DOUBLE COMPLEX ARRAYS */
+struct my_double_complex
+{
+  double real;
+  double imag;
+}__attribute__((__packed__));
 
-extern pfft_complex **cvector_fft;
+extern long int cvector_size;
+extern struct my_double_complex **cvector_fft; /* Now cvector_fft is a struct my_double_complex, not pfft_complex anymore */
 extern double **rvector_fft;
+
+/* Structure containing informations about heffte options */
+extern heffte_plan_options options_fft;
+
+/* define inbox and outbox to be initialized in set_one_grid(ThisGrid) function */
+extern int inbox_low[3], inbox_high[3], outbox_low[3], outbox_high[3];
 
 #ifdef READ_PK_TABLE
 typedef struct
 {
   int Nkbins, NCAMB;
-  char MatterFile[SBLENGTH], TransferFile[SBLENGTH], RunName[SBLENGTH], RedshiftsFile[LBLENGTH];
+  char MatterFile[SBLENGTH], RedshiftsFile[LBLENGTH];
   double *Logk, *LogPkref, D2ref, *Scalef, *RefGM;
 } camb_data;
 #endif
 
 typedef struct
 {
-  double Omega0, OmegaLambda, Hubble100, Sigma8, OmegaBaryon, DEw0, DEwa, 
-    PrimordialIndex, InterPartDist, BoxSize, BoxSize_htrue, BoxSize_h100, ParticleMass, 
-    StartingzForPLC, LastzForPLC, InputSpectrum_UnitLength_in_cm, WDM_PartMass_in_kev, 
-    BoundaryLayerFactor, Largest, MaxMemPerParticle, k_for_GM, PredPeakFactor, PLCAperture,
-    PLCCenter[3], PLCAxis[3];
-  char RunFlag[SBLENGTH],DumpDir[SBLENGTH],TabulatedEoSfile[LBLENGTH],ParameterFile[LBLENGTH],
-    OutputList[LBLENGTH],FileWithInputSpectrum[LBLENGTH],CTtableFile[LBLENGTH];
-  int GridSize[3],DumpProducts,ReadProductsFromDumps,
-    CatalogInAscii, DoNotWriteCatalogs, DoNotWriteHistories, WriteTimelessSnapshot,
-    OutputInH100, RandomSeed, MaxMem, NumFiles, 
-    BoxInH100, simpleLambda, AnalyticMassFunction, MinHaloMass, PLCProvideConeData, ExitIfExtraParticles,
-    use_transposed_fft, FixedIC, PairedIC;
+  double Omega0, OmegaLambda, Hubble100, Sigma8, OmegaBaryon, DEw0, DEwa,
+      PrimordialIndex, InterPartDist, BoxSize, BoxSize_htrue, BoxSize_h100, ParticleMass,
+      StartingzForPLC, LastzForPLC, InputSpectrum_UnitLength_in_cm, WDM_PartMass_in_kev,
+      BoundaryLayerFactor, Largest, MaxMemPerParticle, k_for_GM, PredPeakFactor, PLCAperture,
+      PLCCenter[3], PLCAxis[3];
+  char RunFlag[SBLENGTH], DumpDir[SBLENGTH], TabulatedEoSfile[LBLENGTH], ParameterFile[LBLENGTH],
+      OutputList[LBLENGTH], FileWithInputSpectrum[LBLENGTH], CTtableFile[LBLENGTH];
+  int GridSize[3], DumpProducts, ReadProductsFromDumps,
+      CatalogInAscii, DoNotWriteCatalogs, DoNotWriteHistories, WriteTimelessSnapshot,
+      OutputInH100, RandomSeed, MaxMem, NumFiles,
+      BoxInH100, simpleLambda, AnalyticMassFunction, MinHaloMass, PLCProvideConeData, ExitIfExtraParticles,
+      use_transposed_fft, FixedIC, PairedIC, use_gpu_direct,
+      NumMassPlanes,         /* number of mass planes for MASS_MAPS feature (0 disables) */
+      MassMapNSIDE;          /* HEALPix NSIDE for MASS_MAPS (0 disables) */
+  double MassMapMasterMaxGB; /* Max GB of memory rank 0 may use for one HEALPix plane (counts array) */
+#ifdef READ_HUBBLE_TABLE
+  char HubbleTableFile[LBLENGTH];
+#endif
 #ifdef READ_PK_TABLE
   camb_data camb;
 #endif
@@ -446,10 +486,9 @@ extern param_data params;
 typedef struct
 {
   int n;
-  double F[MAXOUTPUTS],z[MAXOUTPUTS],zlast,Flast;
+  double F[MAXOUTPUTS], z[MAXOUTPUTS], zlast, Flast;
 } output_data;
 extern output_data outputs;
-
 
 typedef struct
 {
@@ -457,24 +496,65 @@ typedef struct
   unsigned int Nalloc, Nneeded;
   int nbox[3];
   int mybox[3];
-  int Lgrid[3]; 
-  int Lgwbl[3]; 
+  int Lgrid[3];
+  int Lgwbl[3];
   int start[3];
   int stabl[3];
   int safe[3];
   int pbc[3];
-  double SafetyBorder,overhead;
+  double SafetyBorder, overhead;
 } subbox_data;
 extern subbox_data subbox;
 
+#ifdef MASS_MAPS
+/* ------------------------------------------------------------ */
+/* Mass sheet definitions derived from output redshift list     */
+/* Each consecutive pair (z_hi > z_lo) defines one sheet.       */
+/* ------------------------------------------------------------ */
 typedef struct
 {
-  double init,total, dens, fft, coll, invcoll, ell, vel, lpt, fmax, distr, sort, group, frag, io,
-    deriv, mem_transf, partial, set_subboxes, set_plc, memory_allocation, fft_initialization
+  double z_hi, z_lo;     /* redshift bounds (z_hi > z_lo) */
+  double chi_hi, chi_lo; /* comoving distances (same order) */
+  double inv_dchi;       /* 1/(chi_hi - chi_lo) */
+  double delta_z;        /* z_hi - z_lo */
+  double delta_chi;      /* chi_hi - chi_lo */
+  double da_hi, da_lo;   /* angular diameter distances at boundaries */
+  double chi3_diff;      /* chi_hi^3 - chi_lo^3 */
+} MassSheet;
+
+extern MassSheet *MassSheets;
+extern int NMassSheets;            /* = outputs.n - 1 when MASS_MAPS active */
+extern double *MassMapBoundaryZ;   /* length NMassSheets+1 (== outputs.n) */
+extern double *MassMapBoundaryChi; /* length NMassSheets+1 */
+extern double *MassMapBoundaryDA;  /* length NMassSheets+1 */
+int mass_maps_init_sheets(void);   /* allocate & fill MassSheets; returns 0 on success */
+void mass_maps_free_sheets(void);
+int mass_maps_write_sheet_table(void);
+
+/* MASS_MAPS / PLC auxiliary utilities */
+int mass_maps_particle_sign_change(int rep_id,
+                                   const double q[3],                      /* Lagrangian or reference position */
+                                   const double disp_prev[3],              /* previous total displacement */
+                                   const double disp_curr[3],              /* current total displacement */
+                                   double z_prev,                          /* previous redshift */
+                                   double z_curr,                          /* current redshift */
+                                   double *alpha_out,                      /* crossing interpolation fraction (0..1) */
+                                   double entry_pos[3],                    /* interpolated entry Eulerian position */
+                                   double *chi_cross_out);                 /* interpolated comoving distance at crossing */
+int mass_maps_point_inside_lightcone(const double pos[3], long *ipix_out); /* if inside and NSIDE>0 sets *ipix_out, else -1 */
+/* Segment-level orchestrator (called after build_groups). */
+void mass_maps_process_segment(int segment_index, double z_segment, int is_first_segment);
+#endif /* MASS_MAPS */
+
+typedef struct
+{
+  double init, total, dens, fft, coll, invcoll, ell, vel, lpt, fmax, distr, sort, group, frag, io,
+      deriv, mem_transf, partial, set_subboxes, set_plc, memory_allocation, fft_initialization, fft_compute
 #ifdef PLC
-    ,plc
+      ,
+      plc
 #endif
-    ;
+      ;
 } cputime_data;
 extern cputime_data cputime;
 
@@ -500,7 +580,7 @@ extern int WindowFunctionType;
 typedef struct
 {
   int Mass;
-  PRODFLOAT Pos[3],Vel[3];
+  PRODFLOAT Pos[3], Vel[3];
 #ifdef TWO_LPT
   PRODFLOAT Vel_2LPT[3];
 #ifdef THREE_LPT
@@ -519,7 +599,7 @@ typedef struct
   int ll, halo_app, mass_at_merger, merged_with, point, bottom, good;
   PRODFLOAT t_appear, t_peak, t_merge;
   unsigned long long int name;
-  int trackT,trackC;
+  int trackT, trackC;
 #ifdef PLC
   PRODFLOAT Flast;
 #endif
@@ -529,19 +609,19 @@ extern group_data *groups;
 #ifdef PLC
 typedef struct
 {
-  int i,j,k;
-  PRODFLOAT F1,F2;
+  int i, j, k;
+  PRODFLOAT F1, F2;
 } replication_data;
 
 typedef struct
 {
   int Nreplications, Nmax, Nstored, Nstored_last, Nhalotot;
   double Nexpected;
-  double Fstart,Fstop,center[3];
-  double xvers[3],yvers[3],zvers[3];
+  double Fstart, Fstop, center[3];
+  double xvers[3], yvers[3], zvers[3];
   replication_data *repls;
   int nzbins;
-  double delta_z,*nz;
+  double delta_z, *nz;
 } plc_data;
 extern plc_data plc;
 
@@ -549,14 +629,14 @@ typedef struct
 {
   int Mass;
   unsigned long long int name;
-  PRODFLOAT z,x[3],v[3]; //,rhor,theta,phi;
+  PRODFLOAT z, x[3], v[3]; //,rhor,theta,phi;
 } plcgroup_data;
 extern plcgroup_data *plcgroups;
 #endif
 
 extern char date_string[25];
 
-extern int *frag_pos,*indices,*indicesY,*sorted_pos,*group_ID,*linking_list;
+extern int *frag_pos, *indices, *indicesY, *sorted_pos, *group_ID, *linking_list;
 
 extern unsigned int *frag_map, *frag_map_update;
 extern int map_to_be_used;
@@ -574,21 +654,20 @@ typedef struct
   unsigned long long int name;
   int nick, ll, mw, mass, mam;
   PRODFLOAT zme, zpe, zap;
-}  histories_data;
+} histories_data;
 
 #define DELTAM 0.05
 
 typedef struct
 {
   int NBIN;
-  double mmin,mmax,vol,hfactor,hfactor4;
-  int *ninbin,*ninbin_local;
-  double *massinbin,*massinbin_local;
+  double mmin, mmax, vol, hfactor, hfactor4;
+  int *ninbin, *ninbin_local;
+  double *massinbin, *massinbin_local;
 } mf_data;
 extern mf_data mf;
 
-
-// Declarations for the variables
+/* splines for interpolations */
 extern gsl_spline **SPLINE;
 extern gsl_interp_accel **ACCEL;
 #if defined(SCALE_DEPENDENT) && defined(ELL_CLASSIC)
@@ -596,15 +675,14 @@ extern gsl_spline **SPLINE_INVGROW;
 extern gsl_interp_accel **ACCEL_INVGROW;
 #endif
 
-
 #ifdef MOD_GRAV_FR
 extern double H_over_c;
 #endif
 
 typedef struct
 {
-  size_t prods, fields, fields_to_keep, fft, first_allocated, fmax_total, 
-    frag_prods, frag_arrays, groups, frag_allocated, frag_total, all_allocated, all;
+  size_t prods, fields, fields_to_keep, fft, first_allocated, fmax_total,
+      frag_prods, frag_arrays, groups, frag_allocated, frag_total, all_allocated, all;
 } memory_data;
 extern memory_data memory;
 
@@ -612,13 +690,13 @@ extern int ngroups;
 
 typedef struct
 {
-  int M,i;
-  PRODFLOAT R,q[3],v[3],D,Dv,w;
-  double z,myk;
+  int M, i;
+  PRODFLOAT R, q[3], v[3], D, Dv, w;
+  double z, myk;
 #ifdef TWO_LPT
-  PRODFLOAT D2,D2v,v2[3],w2;
+  PRODFLOAT D2, D2v, v2[3], w2;
 #ifdef THREE_LPT
-  PRODFLOAT D31,D31v,v31[3],D32,D32v,v32[3],w31,w32;
+  PRODFLOAT D31, D31v, v31[3], D32, D32v, v32[3], w31, w32;
 #endif
 #endif
 #ifdef RECOMPUTE_DISPLACEMENTS
@@ -626,7 +704,7 @@ typedef struct
 #ifdef TWO_LPT
   PRODFLOAT v2_prev[3];
 #ifdef THREE_LPT
-  PRODFLOAT v31_prev[3],v32_prev[3];
+  PRODFLOAT v31_prev[3], v32_prev[3];
 #endif
 #endif
 #endif
@@ -635,29 +713,28 @@ typedef struct
 typedef struct
 {
   unsigned long long int name;
-  PRODFLOAT M,x[3],v[3];
+  PRODFLOAT M, x[3], v[3];
   PRODFLOAT q[3];
 #ifndef LIGHT_OUTPUT
   int n;
   int pad;
 #endif
-}  catalog_data;
+} catalog_data;
 
 typedef struct
 {
   unsigned long long int name;
 #ifndef LIGHT_OUTPUT
-  PRODFLOAT red,x,y,z,vx,vy,vz,Mass,theta,phi,v_los,obsz;
+  PRODFLOAT red, x, y, z, vx, vy, vz, Mass, theta, phi, v_los, obsz;
 #else
-  PRODFLOAT red,Mass,theta,phi,obsz;
+  PRODFLOAT red, Mass, theta, phi, obsz;
 #endif
 } plc_write_data;
-
 
 typedef struct
 {
   int nseg, myseg, no_interp, order;
-  double z[MAXOUTPUTS],D[MAXOUTPUTS],D2[MAXOUTPUTS],D31[MAXOUTPUTS],D32[MAXOUTPUTS];
+  double z[MAXOUTPUTS], D[MAXOUTPUTS], D2[MAXOUTPUTS], D31[MAXOUTPUTS], D32[MAXOUTPUTS];
   double redshift; /* this is the redshift used in compute_derivative */
 } ScaleDep_data;
 extern ScaleDep_data ScaleDep;
@@ -693,8 +770,8 @@ void write_from_rvector(int, double *);
 void write_from_rvector_to_products(int, int, int);
 
 // PROBABILMENTE DA TOGLIERE DOPO IL DEBUG
-void dump_cvector(double*, int, int, ptrdiff_t *, ptrdiff_t *,  char *, int);
-void dump_rvector(double*, int, ptrdiff_t *, ptrdiff_t *,  char *, int);
+void dump_cvector(double *, int, int, ptrdiff_t *, ptrdiff_t *, char *, int);
+void dump_rvector(double *, int, ptrdiff_t *, ptrdiff_t *, char *, int);
 
 /* prototypes for functions defined in allocations.c */
 int organize_main_memory(void);
@@ -730,29 +807,32 @@ int write_timeless_snapshot(void);
 #endif
 
 /* prototypes for functions defined in cosmo.c */
+int checked_spline_init(gsl_spline *, const double[], const double[], size_t, const char *);
+int checked_spline2d_init(gsl_spline2d *, const double[], const double[], const double[], size_t, size_t, const char *);
 int initialize_cosmology();
 int initialize_MassVariance();
 double OmegaMatter(double);
 double OmegaLambda(double);
 double Hubble(double);
+double Ez(double);
 double Hubble_Gyr(double);
-double fomega(double,double);
-double fomega_2LPT(double,double);
-double fomega_3LPT_2(double,double);
-double fomega_3LPT_1(double,double);
+double fomega(double, double);
+double fomega_2LPT(double, double);
+double fomega_3LPT_2(double, double);
+double fomega_3LPT_1(double, double);
 double CosmicTime(double);
 double InverseCosmicTime(double);
-double GrowingMode(double,double);
-double GrowingMode_2LPT(double,double);
-double GrowingMode_3LPT_1(double,double);
-double GrowingMode_3LPT_2(double,double);
-double InverseGrowingMode(const double, const int);
+double GrowingMode(double, double);
+double GrowingMode_2LPT(double, double);
+double GrowingMode_3LPT_1(double, double);
+double GrowingMode_3LPT_2(double, double);
+double InverseGrowingMode(double, int);
 #if defined(GPU_OMP) || defined(GPU_OMP_FULL)
 #pragma omp declare target (InverseGrowingMode)
 #endif // GPU_OMP || FULL_GPU_OMP
 double ComovingDistance(double);
+double DiameterDistance(double);
 double InverseComovingDistance(double);
-double dComovingDistance_dz(double);
 double PowerSpectrum(double);
 double MassVariance(double);
 double dMassVariance_dr(double);
@@ -764,7 +844,8 @@ double dOmega_dVariance(double, double);
 double AnalyticMassFunction(double, double);
 double WindowFunction(double);
 double my_spline_eval(gsl_spline *, double, gsl_interp_accel *);
-int jac(double, const double [], double *, double [], void *);
+double my_spline_eval_deriv(gsl_spline *, double, gsl_interp_accel *);
+int jac(double, const double[], double *, double[], void *);
 
 /* prototypes for functions defined in ReadParamFile.c */
 int read_parameter_file();
@@ -772,7 +853,10 @@ int read_parameter_file();
 /* prototypes for functions defined in fmax.c */
 int compute_fmax(void);
 int compute_displacements(int, int, double);
-int compute_first_derivatives(double, int, int, double*);
+int compute_first_derivatives(double, int, int, double *);
+/* Fast path for scale-independent growth: rescale per-particle displacement
+  fields from z_prev to z_curr instead of recomputing FFT derivatives. */
+int scale_products_displacements(double z_prev, double z_curr);
 char *fdate(void);
 int dump_products(void);
 int read_dumps(void);
@@ -784,7 +868,10 @@ int compute_LPT_displacements(int, double);
 
 /* prototypes for functions defined in distribute.c */
 int distribute(void);
+int distribute_alltoall(void);
 int distribute_back(void);
+int my_distribute_back(void);
+int distribute_back_alltoall(void);
 
 /* prototypes for functions defined in fragment.c */
 int fragment_driver(void);
@@ -796,15 +883,14 @@ int estimate_file_size(void);
 double compute_Nhalos_in_PLC(double, double);
 
 /* prototypes for functions defined in build_groups.c */
-int build_groups(int,double,int);
+int build_groups(int, double, int);
 int quick_build_groups(int);
 int update_map(unsigned int *);
 
 // RIMETTERE LA LETTURA DEL WHITE NOISE
-//#ifdef WHITENOISE
-//int read_white_noise(void);
-//#endif
-
+// #ifdef WHITENOISE
+// int read_white_noise(void);
+// #endif
 
 /* fragmentation prototypes */
 void condition_for_accretion(int, int, int, int, int, PRODFLOAT, int, double *, double *); // LEVARE primo argomento

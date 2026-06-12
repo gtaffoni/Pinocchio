@@ -2,30 +2,27 @@
  *                        PINOCCHIO  V5.1                        *
  *  (PINpointing Orbit-Crossing Collapsed HIerarchical Objects)  *
  *****************************************************************
- 
+
  This code was written by
- Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan, 
+ Pierluigi Monaco, Tom Theuns, Giuliano Taffoni, Marius Lepinzan,
  Chiara Moretti, Luca Tornatore, David Goz, Tiago Castro
  Copyright (C) 2025
- 
+
  github: https://github.com/pigimonaco/Pinocchio
  web page: http://adlibitum.oats.inaf.it/monaco/pinocchio.html
- 
+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation; either version 2 of the License, or
  (at your option) any later version.
- 
  This program is distributed in the hope that it will be useful,
  but WITHOUT ANY WARRANTY; without even the implied warranty of
  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  GNU General Public License for more details.
- 
  You should have received a copy of the GNU General Public License
  along with this program; if not, write to the Free Software
  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
-
 
 #include "pinocchio.h"
 #include "def_splines.h"
@@ -35,10 +32,10 @@
 
 void abort_code(void);
 
-/* 
-   Order-of-magnitude estimate of the needed overhead: 
+/*
+   Order-of-magnitude estimate of the needed overhead:
    sigma < 6 : overhead = (sigma/6)**2   * 3.8 * 1.1 (margin)
-   sigma > 6 : overhead = (sigma/6)**0.6 * 3.8 * 1.1 (margin)   
+   sigma > 6 : overhead = (sigma/6)**0.6 * 3.8 * 1.1 (margin)
 */
 
 int main(int argc, char **argv, char **envp)
@@ -59,37 +56,35 @@ int main(int argc, char **argv, char **envp)
   }
 #endif
 
+  if (NTasks > 1)
+  {
+    printf("Please run this code in a scalar mode, on 1 task only\n");
+    MPI_Finalize();
+    return 0;
+  }
 
-  if (NTasks>1)
-    {
-      printf("Please run this code in a scalar mode, on 1 task only\n");
-      MPI_Finalize();
-      return 0;
-    }
-
-  if (argc<4)
-    {
-      printf("Usage: run_planner paramfile RamPerNode (Gb) TasksPerNode [Nnodes]\n");
-      MPI_Finalize();
-      return 0;
-    }
+  if (argc < 4)
+  {
+    printf("Usage: run_planner paramfile RamPerNode (Gb) TasksPerNode [Nnodes]\n");
+    MPI_Finalize();
+    return 0;
+  }
 
   int RamPerNode = atoi(argv[2]);
   int TasksPerNode = atoi(argv[3]);
-  int RamPerTask = (int)( (1024. * (double)RamPerNode) / (double)TasksPerNode);
+  int RamPerTask = (int)((1024. * (double)RamPerNode) / (double)TasksPerNode);
   double overhead;
   int ForceNnodes;
-  if (argc>=5)
-    {
-      ForceNnodes = atoi(argv[4]);
-    }
+  if (argc >= 5)
+  {
+    ForceNnodes = atoi(argv[4]);
+  }
   else
     ForceNnodes = 0;
 
-  printf("run_planner planning a run on nodes with %d Gb or RAM each, with %d tasks per node\n",RamPerNode,TasksPerNode);
+  printf("run_planner planning a run on nodes with %d Gb or RAM each, with %d tasks per node\n", RamPerNode, TasksPerNode);
   if (ForceNnodes)
-    printf("The number of nodes will be forced to %d\n",ForceNnodes);
-
+    printf("The number of nodes will be forced to %d\n", ForceNnodes);
 
   printf("\n");
   printf("********************************************** \n");
@@ -101,7 +96,7 @@ int main(int argc, char **argv, char **envp)
   workspace = gsl_integration_workspace_alloc(NWINT);
 
   memset(&params, 0, sizeof(param_data));
-  strcpy(params.ParameterFile,argv[1]);
+  strcpy(params.ParameterFile, argv[1]);
 
   if (set_parameters())
     exit(1);
@@ -110,7 +105,7 @@ int main(int argc, char **argv, char **envp)
     exit(1);
 
   /* now it re-initializes the variance with a SKS filter */
-  WindowFunctionType=1;
+  WindowFunctionType = 1;
   if (initialize_MassVariance())
     return 1;
 
@@ -121,28 +116,27 @@ int main(int argc, char **argv, char **envp)
   printf("\n");
 
   /* sets the main grid variables */
-  Ngrids=1;
+  Ngrids = 1;
 
-  MyGrids=(grid_data*)malloc(Ngrids * sizeof(grid_data));
+  MyGrids = (grid_data *)malloc(Ngrids * sizeof(grid_data));
 
   MyGrids[0].GSglobal[_x_] = params.GridSize[_x_];
   MyGrids[0].GSglobal[_y_] = params.GridSize[_y_];
   MyGrids[0].GSglobal[_z_] = params.GridSize[_z_];
 
-  MyGrids[0].Ntotal = (unsigned long long)MyGrids[0].GSglobal[_x_] * 
-    (unsigned long long)MyGrids[0].GSglobal[_y_] * 
-    (unsigned long long)MyGrids[0].GSglobal[_z_];
+  MyGrids[0].Ntotal = (unsigned long long)MyGrids[0].GSglobal[_x_] *
+                      (unsigned long long)MyGrids[0].GSglobal[_y_] *
+                      (unsigned long long)MyGrids[0].GSglobal[_z_];
 
   MyGrids[0].BoxSize = params.BoxSize_htrue;
 
-  memset(&memory,0,sizeof(memory_data));
+  memset(&memory, 0, sizeof(memory_data));
 
-  double sigma = sqrt(MassVariance(params.BoxSize_htrue/(double)params.GridSize[_x_]/PI/NYQUIST));
+  double sigma = sqrt(MassVariance(params.BoxSize_htrue / (double)params.GridSize[_x_] / PI / NYQUIST));
 #ifndef CLASSIC_FRAGMENTATION
   /* needed overhead is estimated based on the mass variance on the grid */
-  overhead = (sigma < 6 ? pow(sigma/6.0,2.0) * 3.8 * MARGIN : pow(sigma/6.0,0.6) * 3.8 * MARGIN);
+  overhead = (sigma < 6 ? pow(sigma / 6.0, 2.0) * 3.8 * MARGIN : pow(sigma / 6.0, 0.6) * 3.8 * MARGIN);
 #endif
-
 
 #ifdef TWO_LPT
 #ifdef THREE_LPT
@@ -157,126 +151,123 @@ int main(int argc, char **argv, char **envp)
   baseline += 4;
 #endif
 
-
   /* setting MaxMemPerParticle */
   params.MaxMemPerParticle = baseline;
-  double old=0.0; int Nnodes=0;
+  double old = 0.0;
+  int Nnodes = 0;
 
 #ifndef CLASSIC_FRAGMENTATION
-  printf("needed overhead: %f\n",overhead);
+  printf("needed overhead: %f\n", overhead);
 #endif
-  int count=0, result;
+  int count = 0, result;
 
   if (ForceNnodes)
+  {
+    /* in this case the number of nodes is fixed */
+    params.MaxMemPerParticle = (int)(ForceNnodes / ((double)MyGrids[0].Ntotal / GBYTE / (double)RamPerNode)) - 1;
+    if (params.MaxMemPerParticle < baseline)
     {
-      /* in this case the number of nodes is fixed */
-      params.MaxMemPerParticle = (int)(ForceNnodes / ((double)MyGrids[0].Ntotal / GBYTE / (double)RamPerNode) ) - 1;
-      if (params.MaxMemPerParticle<baseline)
-	{
-	  printf("**************************************************************************\n");
-	  printf("The number of nodes you provided is insufficient, I will compute it myself\n");
-	  printf("**************************************************************************\n");
-	  Nnodes=0;
-	}
-      else
-	{
-	  NTasks = ForceNnodes * TasksPerNode;
-
-	  MyGrids[0].ParticlesPerTask = (int)((double)MyGrids[0].Ntotal / (double)NTasks);
-	  /* proxies for pfft allocation */
-	  MyGrids[0].total_local_size = MyGrids[0].ParticlesPerTask;
-	  MyGrids[0].total_local_size_fft = MyGrids[0].total_local_size
-	    * (MyGrids[0].GSglobal[_x_] + 1) / MyGrids[0].GSglobal[_x_];
-
-	  printf("\n");
-	  printf("********************************************** \n");
-	  printf("                set_subboxes output            \n");
-	  printf("********************************************** \n");
-	  printf("\n");
-	  result = set_subboxes();
-	  printf("\n");
-	  printf("********************************************** \n");
-	  printf("\n");
-
-	  if (result)
-	    {
-	      printf("**************************************************************************\n");
-	      printf("The number of nodes you provided is insufficient, I will compute it myself\n");
-	      printf("**************************************************************************\n");
-	      Nnodes=0;
-	    }
-	  else
-	    {
-	      printf("I found a successful configuration on %d nodes\n",ForceNnodes);
-	      Nnodes = ForceNnodes;
-	    }
-	}
+      printf("**************************************************************************\n");
+      printf("The number of nodes you provided is insufficient, I will compute it myself\n");
+      printf("**************************************************************************\n");
+      Nnodes = 0;
     }
+    else
+    {
+      NTasks = ForceNnodes * TasksPerNode;
+
+      MyGrids[0].ParticlesPerTask = (int)((double)MyGrids[0].Ntotal / (double)NTasks);
+      /* proxies for pfft allocation */
+      MyGrids[0].total_local_size = MyGrids[0].ParticlesPerTask;
+      MyGrids[0].total_local_size_fft = MyGrids[0].total_local_size * (MyGrids[0].GSglobal[_x_] + 1) / MyGrids[0].GSglobal[_x_];
+
+      printf("\n");
+      printf("********************************************** \n");
+      printf("                set_subboxes output            \n");
+      printf("********************************************** \n");
+      printf("\n");
+      result = set_subboxes();
+      printf("\n");
+      printf("********************************************** \n");
+      printf("\n");
+
+      if (result)
+      {
+        printf("**************************************************************************\n");
+        printf("The number of nodes you provided is insufficient, I will compute it myself\n");
+        printf("**************************************************************************\n");
+        Nnodes = 0;
+      }
+      else
+      {
+        printf("I found a successful configuration on %d nodes\n", ForceNnodes);
+        Nnodes = ForceNnodes;
+      }
+    }
+  }
 
   if (!Nnodes)
+  {
+    /* in this case it finds the number of needed nodes */
+    do
     {
-      /* in this case it finds the number of needed nodes */
-      do
-	{
 #ifdef CLASSIC_FRAGMENTATION
-	  if (old==params.MaxMemPerParticle)
-	    params.MaxMemPerParticle+=10;
+      if (old == params.MaxMemPerParticle)
+        params.MaxMemPerParticle += 10;
 #endif
 
-	  old = params.MaxMemPerParticle;
-	  /* estimate of the number of needed nodes */
-	  Nnodes = (int)((double)MyGrids[0].Ntotal * params.MaxMemPerParticle / GBYTE / (double)RamPerNode + 1);
-	  NTasks = Nnodes * TasksPerNode;
+      old = params.MaxMemPerParticle;
+      /* estimate of the number of needed nodes */
+      Nnodes = (int)((double)MyGrids[0].Ntotal * params.MaxMemPerParticle / GBYTE / (double)RamPerNode + 1);
+      NTasks = Nnodes * TasksPerNode;
 
-	  MyGrids[0].ParticlesPerTask = (int)((double)MyGrids[0].Ntotal / (double)NTasks);
+      MyGrids[0].ParticlesPerTask = (int)((double)MyGrids[0].Ntotal / (double)NTasks);
 
-	  /* proxies for pfft allocation */
-	  MyGrids[0].total_local_size = MyGrids[0].ParticlesPerTask;
-	  MyGrids[0].total_local_size_fft = MyGrids[0].total_local_size
-	    * (MyGrids[0].GSglobal[_x_] + 1) / MyGrids[0].GSglobal[_x_];
+      /* proxies for pfft allocation */
+      MyGrids[0].total_local_size = MyGrids[0].ParticlesPerTask;
+      MyGrids[0].total_local_size_fft = MyGrids[0].total_local_size * (MyGrids[0].GSglobal[_x_] + 1) / MyGrids[0].GSglobal[_x_];
 
-	  printf("\n");
-	  printf("********************************************** \n");
-	  printf("  set_subboxes output, IGNORE ERROR MESSAGES   \n");
-	  printf("********************************************** \n");
-	  printf("\n");
-	  result = set_subboxes();
-	  printf("\n");
-	  printf("********************************************** \n");
-	  printf("\n");
+      printf("\n");
+      printf("********************************************** \n");
+      printf("  set_subboxes output, IGNORE ERROR MESSAGES   \n");
+      printf("********************************************** \n");
+      printf("\n");
+      result = set_subboxes();
+      printf("\n");
+      printf("********************************************** \n");
+      printf("\n");
 
 #ifdef CLASSIC_FRAGMENTATION
-	  /* I add a 5% margin here */
-	  overhead = (double)subbox.Npart / (double)MyGrids[0].ParticlesPerTask * 1.05;
+      /* I add a 5% margin here */
+      overhead = (double)subbox.Npart / (double)MyGrids[0].ParticlesPerTask * 1.05;
 #endif
 
-	  params.MaxMemPerParticle = 
-	    overhead * (double)(sizeof(product_data) + FRAGFIELDS * sizeof(int)) +
-	    (double)(memory.prods + memory.groups) / (double)MyGrids[0].ParticlesPerTask;
-	  if (params.MaxMemPerParticle<baseline)
-	    params.MaxMemPerParticle = baseline;
+      params.MaxMemPerParticle =
+          overhead * (double)(sizeof(product_data) + FRAGFIELDS * sizeof(int)) +
+          (double)(memory.prods + memory.groups) / (double)MyGrids[0].ParticlesPerTask;
+      if (params.MaxMemPerParticle < baseline)
+        params.MaxMemPerParticle = baseline;
 
-	  printf("I tried MaxMemPerParticle = %d; Nnodes = %d; NTasks = %d; MyGrids[0].ParticlesPerTask = %d; new MaxMemPerParticle = %d\n",(int)old,Nnodes,NTasks,MyGrids[0].ParticlesPerTask,(int)params.MaxMemPerParticle);
-	  count++;
+      printf("I tried MaxMemPerParticle = %d; Nnodes = %d; NTasks = %d; MyGrids[0].ParticlesPerTask = %d; new MaxMemPerParticle = %d\n", (int)old, Nnodes, NTasks, MyGrids[0].ParticlesPerTask, (int)params.MaxMemPerParticle);
+      count++;
 
-	} while ((params.MaxMemPerParticle > old || result==1) && count<=MAXCOUNT);
+    } while ((params.MaxMemPerParticle > old || result == 1) && count <= MAXCOUNT);
 
-      if (count>MAXCOUNT)
-	{
-	  printf("Sorry, I could not find an acceptable configuration for this run!\n");
+    if (count > MAXCOUNT)
+    {
+      printf("Sorry, I could not find an acceptable configuration for this run!\n");
 #ifdef CLASSIC_FRAGMENTATION
-	  printf("This is too much for CLASSIC_FRAGMENTATION, please uncomment this option in the Makefile\n");
+      printf("This is too much for CLASSIC_FRAGMENTATION, please uncomment this option in the Makefile\n");
 #else
-	  printf("Try to contact pierluigi.monaco@inaf for some help\n");
+      printf("Try to contact pierluigi.monaco@inaf for some help\n");
 #endif
-	  return 1;
-	}
+      return 1;
     }
+  }
 
-
-  params.MaxMem            = RamPerTask;
-  params.PredPeakFactor    = (sigma < 6 ? (sigma-6)/3.0 + 1.5 : 1.5);
-  if (params.PredPeakFactor<0.6)
+  params.MaxMem = RamPerTask;
+  params.PredPeakFactor = (sigma < 6 ? (sigma - 6) / 3.0 + 1.5 : 1.5);
+  if (params.PredPeakFactor < 0.6)
     params.PredPeakFactor = 0.6;
 #ifdef CLASSIC_FRAGMENTATION
   params.BoundaryLayerFactor = 1;
@@ -285,24 +276,23 @@ int main(int argc, char **argv, char **envp)
 #endif
 
   printf("\n********************************************** \n");
-  printf("Density std dev on grid for this run: %f\n",sigma);
-  printf("We assume a value of MaxMemPerParticle of %d\n",(int)params.MaxMemPerParticle);
-  printf("The number of nodes needed for this run is: %d\n",Nnodes);
-  printf("Number of MPI tasks used for the run: %d\n",NTasks);
+  printf("Density std dev on grid for this run: %f\n", sigma);
+  printf("We assume a value of MaxMemPerParticle of %d\n", (int)params.MaxMemPerParticle);
+  printf("The number of nodes needed for this run is: %d\n", Nnodes);
+  printf("Number of MPI tasks used for the run: %d\n", NTasks);
 
   if ((int)(MyGrids[0].ParticlesPerTask * params.MaxMemPerParticle / MBYTE + 1.0) > params.MaxMem)
-    {
-      printf("ERROR: MaxMem of %d Mb per task is insufficient to store %d bytes per particle\n",
-	     params.MaxMem, (int)params.MaxMemPerParticle);
-      printf("       please increase MaxMem to at least %d\n",
-	     (int)(MyGrids[0].ParticlesPerTask * params.MaxMemPerParticle / MBYTE + 1.0));
+  {
+    printf("ERROR: MaxMem of %d Mb per task is insufficient to store %d bytes per particle\n",
+           params.MaxMem, (int)params.MaxMemPerParticle);
+    printf("       please increase MaxMem to at least %d\n",
+           (int)(MyGrids[0].ParticlesPerTask * params.MaxMemPerParticle / MBYTE + 1.0));
 
-      return 1;
-    }
-
+    return 1;
+  }
 
   /* now it re-initializes the variance with a top-hat filter */
-  WindowFunctionType=2;
+  WindowFunctionType = 2;
   if (initialize_MassVariance())
     return 1;
 
@@ -328,66 +318,66 @@ int main(int argc, char **argv, char **envp)
   printf("  but keep a margin to it.\n");
   printf("\n");
 
-  struct map{
+  struct map
+  {
     int lz;
-    double oh,am,m1,m2,m3,m4,m5,m6,m7,m8;
+    double oh, am, m1, m2, m3, m4, m5, m6, m7, m8;
   } mymap;
 
-  mymap.am=(double)memory.all/MBYTE;
-  mymap.oh=(double)subbox.Nalloc/(double)MyGrids[0].ParticlesPerTask;
-  mymap.m1=(double)memory.prods/(double)MyGrids[0].ParticlesPerTask;
-  mymap.m2=(double)(memory.fields+memory.fields_to_keep)/(double)MyGrids[0].ParticlesPerTask;
-  mymap.m3=(double)memory.fft/(double)MyGrids[0].ParticlesPerTask;
-  mymap.m4=(double)memory.fmax_total/(double)MyGrids[0].ParticlesPerTask;
-  mymap.m5=(double)memory.frag_prods/(double)MyGrids[0].ParticlesPerTask;
-  mymap.m6=(double)(memory.groups+memory.frag_arrays)/(double)MyGrids[0].ParticlesPerTask;
-  mymap.m7=(double)memory.frag_total/(double)MyGrids[0].ParticlesPerTask;
-  mymap.m8=(double)memory.all/(double)MyGrids[0].ParticlesPerTask;
-
+  mymap.am = (double)memory.all / MBYTE;
+  mymap.oh = (double)subbox.Nalloc / (double)MyGrids[0].ParticlesPerTask;
+  mymap.m1 = (double)memory.prods / (double)MyGrids[0].ParticlesPerTask;
+  mymap.m2 = (double)(memory.fields + memory.fields_to_keep) / (double)MyGrids[0].ParticlesPerTask;
+  mymap.m3 = (double)memory.fft / (double)MyGrids[0].ParticlesPerTask;
+  mymap.m4 = (double)memory.fmax_total / (double)MyGrids[0].ParticlesPerTask;
+  mymap.m5 = (double)memory.frag_prods / (double)MyGrids[0].ParticlesPerTask;
+  mymap.m6 = (double)(memory.groups + memory.frag_arrays) / (double)MyGrids[0].ParticlesPerTask;
+  mymap.m7 = (double)memory.frag_total / (double)MyGrids[0].ParticlesPerTask;
+  mymap.m8 = (double)memory.all / (double)MyGrids[0].ParticlesPerTask;
 
   printf("\n");
   printf("Map of memory usage for Task 0:\n");
   printf("Task N.    mem(MB) overhead   products   fields     ffts     fmax  frag pr.  groups fragment  total bytes per particle\n");
 
   printf("%6d   %8.0f  %6.1f       %6.1f   %6.1f   %6.1f   %6.1f   %6.1f   %6.1f   %6.1f   %6.1f\n",
-	 0, mymap.am, mymap.oh, mymap.m1, mymap.m2, mymap.m3, mymap.m4, mymap.m5, mymap.m6, mymap.m7, mymap.m8);
+         0, mymap.am, mymap.oh, mymap.m1, mymap.m2, mymap.m3, mymap.m4, mymap.m5, mymap.m6, mymap.m7, mymap.m8);
 
   printf("\n");
   printf("Complete memory map\n");
-  printf("  memory.prods:           %12zu, %6.1f bpp\n",memory.prods,           (double)memory.prods/(double)MyGrids[0].total_local_size);
-  printf("  memory.fields_to_keep   %12zu, %6.1f bpp\n",memory.fields_to_keep,  (double)memory.fields_to_keep/(double)MyGrids[0].total_local_size);
-  printf("  memory.fields           %12zu, %6.1f bpp\n",memory.fields,          (double)memory.fields/(double)MyGrids[0].total_local_size);
-  printf("  memory.first_allocated: %12zu, %6.1f bpp\n",memory.first_allocated, (double)memory.first_allocated/(double)MyGrids[0].total_local_size);
-  printf("  memory.fft:             %12zu, %6.1f bpp\n",memory.fft,             (double)memory.fft/(double)MyGrids[0].total_local_size);
-  printf("  memory.fmax_total:      %12zu, %6.1f bpp\n",memory.fmax_total,      (double)memory.fmax_total/(double)MyGrids[0].total_local_size);
-  printf("  memory.frag_prods:      %12zu, %6.1f bpp\n",memory.frag_prods,      (double)memory.frag_prods/(double)MyGrids[0].total_local_size);
-  printf("  memory.frag_arrays:     %12zu, %6.1f bpp\n",memory.frag_arrays,     (double)memory.frag_arrays/(double)MyGrids[0].total_local_size);
-  printf("  memory.groups:          %12zu, %6.1f bpp\n",memory.groups,	        (double)memory.groups/(double)MyGrids[0].total_local_size);
-  printf("  memory.frag_allocated:  %12zu, %6.1f bpp\n",memory.frag_allocated,  (double)memory.frag_allocated/(double)MyGrids[0].total_local_size);	       
-  printf("  memory.frag_total:      %12zu, %6.1f bpp\n",memory.frag_total,      (double)memory.frag_total/(double)MyGrids[0].total_local_size);	       
-  printf("  memory.all:             %12zu, %6.1f bpp\n",memory.all,	        (double)memory.all/(double)MyGrids[0].total_local_size);
+  printf("  memory.prods:           %12zu, %6.1f bpp\n", memory.prods, (double)memory.prods / (double)MyGrids[0].total_local_size);
+  printf("  memory.fields_to_keep   %12zu, %6.1f bpp\n", memory.fields_to_keep, (double)memory.fields_to_keep / (double)MyGrids[0].total_local_size);
+  printf("  memory.fields           %12zu, %6.1f bpp\n", memory.fields, (double)memory.fields / (double)MyGrids[0].total_local_size);
+  printf("  memory.first_allocated: %12zu, %6.1f bpp\n", memory.first_allocated, (double)memory.first_allocated / (double)MyGrids[0].total_local_size);
+  printf("  memory.fft:             %12zu, %6.1f bpp\n", memory.fft, (double)memory.fft / (double)MyGrids[0].total_local_size);
+  printf("  memory.fmax_total:      %12zu, %6.1f bpp\n", memory.fmax_total, (double)memory.fmax_total / (double)MyGrids[0].total_local_size);
+  printf("  memory.frag_prods:      %12zu, %6.1f bpp\n", memory.frag_prods, (double)memory.frag_prods / (double)MyGrids[0].total_local_size);
+  printf("  memory.frag_arrays:     %12zu, %6.1f bpp\n", memory.frag_arrays, (double)memory.frag_arrays / (double)MyGrids[0].total_local_size);
+  printf("  memory.groups:          %12zu, %6.1f bpp\n", memory.groups, (double)memory.groups / (double)MyGrids[0].total_local_size);
+  printf("  memory.frag_allocated:  %12zu, %6.1f bpp\n", memory.frag_allocated, (double)memory.frag_allocated / (double)MyGrids[0].total_local_size);
+  printf("  memory.frag_total:      %12zu, %6.1f bpp\n", memory.frag_total, (double)memory.frag_total / (double)MyGrids[0].total_local_size);
+  printf("  memory.all:             %12zu, %6.1f bpp\n", memory.all, (double)memory.all / (double)MyGrids[0].total_local_size);
 
   printf("\n");
-  printf("Number of nodes needed for this run:    %d\n",Nnodes);
-  if (ForceNnodes && ForceNnodes!=Nnodes)
+  printf("Number of nodes needed for this run:    %d\n", Nnodes);
+  if (ForceNnodes && ForceNnodes != Nnodes)
     printf("WARNING: this is different from your request!\n");
-  printf("Number of MPI tasks used for the run:   %d\n",NTasks);
-  printf("Each MPI task will need at least %f Mb\n",MyGrids[0].ParticlesPerTask * params.MaxMemPerParticle / MBYTE + 1.0);
-  double Nfloat = (double)MyGrids[0].Ntotal*(double)params.MaxMemPerParticle / (RamPerNode * GBYTE);
+  printf("Number of MPI tasks used for the run:   %d\n", NTasks);
+  printf("Each MPI task will need at least %f Mb\n", MyGrids[0].ParticlesPerTask * params.MaxMemPerParticle / MBYTE + 1.0);
+  double Nfloat = (double)MyGrids[0].Ntotal * (double)params.MaxMemPerParticle / (RamPerNode * GBYTE);
   printf("This run will occupy memory of %5.2f nodes, %4.2f percent of available memory\n",
-	 Nfloat, 100.*Nfloat / (double)Nnodes);
-  printf("Density standard deviation on the grid: %f\n",sigma);
-  printf("Predicted overhead:                     %f\n",overhead);
+         Nfloat, 100. * Nfloat / (double)Nnodes);
+  printf("Density standard deviation on the grid: %f\n", sigma);
+  printf("Predicted overhead:                     %f\n", overhead);
   printf("You can copy and paste these into the parameter file:\n");
-  printf("   MaxMem                %d\n",params.MaxMem);
-  printf("   MaxMemPerParticle     %d\n",(int)params.MaxMemPerParticle);
-  printf("   PredPeakFactor        %3.1f\n",params.PredPeakFactor);
-  printf("   BoundaryLayerFactor   %3.1f\n",params.BoundaryLayerFactor);
-  if (sigma>5.)
-    printf("WARNING: this is a %shigh resolution run, it may fail at first attempt,\n  but in this case the code will suggest where the problem is.\n",(sigma>6?"very ":""));
+  printf("   MaxMem                %d\n", params.MaxMem);
+  printf("   MaxMemPerParticle     %d\n", (int)params.MaxMemPerParticle);
+  printf("   PredPeakFactor        %3.1f\n", params.PredPeakFactor);
+  printf("   BoundaryLayerFactor   %3.1f\n", params.BoundaryLayerFactor);
+  if (sigma > 5.)
+    printf("WARNING: this is a %shigh resolution run, it may fail at first attempt,\n  but in this case the code will suggest where the problem is.\n", (sigma > 6 ? "very " : ""));
 
 #ifndef CLASSIC_FRAGMENTATION
-  if (sigma>6.)
+  if (sigma > 6.)
     printf("  Please consider using 2.5 or even 2.0 for BoundaryLayerFactor to increase the probability of success\n");
 #endif
   printf("\n");
@@ -399,15 +389,14 @@ int main(int argc, char **argv, char **envp)
   printf(" I'm now checking parameters and directives, this may give error messages \n");
   printf("**************************************************************************\n");
   if (check_parameters_and_directives())
-    {
-      printf("**************************************************************************\n");
-      printf("Please follow these instructions before running the code\n\n");
-    }
+  {
+    printf("**************************************************************************\n");
+    printf("Please follow these instructions before running the code\n\n");
+  }
   else
     printf("**************************************************************************\n");
 
-
-  printf("This is the number of sub-boxes per dimension: %d %d %d\n",subbox.nbox[_x_],subbox.nbox[_y_],subbox.nbox[_z_]);
+  printf("This is the number of sub-boxes per dimension: %d %d %d\n", subbox.nbox[_x_], subbox.nbox[_y_], subbox.nbox[_z_]);
   printf("Their products MUST give the number of tasks.\n");
   printf("The more similar they are, the better (unless some of them is 1).\n");
   printf("If the run is large and the three numbers are not as similar as possible,\ntry to change the number of tasks per node or to ask for a specific number of nodes to achieve a better balance.\n\n");
@@ -419,9 +408,10 @@ int main(int argc, char **argv, char **envp)
   return 0;
 }
 
-
 void abort_code(void)
 {
-  printf("Task %d aborting...\n",ThisTask);
-  MPI_Abort(MPI_COMM_WORLD,1);
+  printf("Task %d aborting...\n", ThisTask);
+  fflush(stdout);
+  fflush(stderr);
+  MPI_Abort(MPI_COMM_WORLD, 1);
 }
