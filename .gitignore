@@ -8,3 +8,10 @@
 *Scorep*
 log
 *.o
+
+# python tooling
+.venv/
+__pycache__/
+*.pyc
+# keep the validation tool's pinned requirements (overrides *.txt above)
+!scripts/requirements.txt

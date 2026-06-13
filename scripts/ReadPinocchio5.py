@@ -347,7 +347,7 @@ class catalog:
             if self.data is None:
                 self.data = np.zeros(NhalosPerFile[myfile], dtype=self.cat_dtype)
             else:
-                self.data.resize(self.data.shape[0]+NhalosPerFile[myfile])
+                self.data.resize(self.data.shape[0]+NhalosPerFile[myfile], refcheck=False)
 
             for name in self.data.dtype.names:
                 self.data[name][-NhalosPerFile[myfile]:]=thiscat[name]
@@ -664,7 +664,7 @@ class plc:
             if self.data is None:
                 self.data = np.zeros(NhalosPerFile[myfile], dtype=self.cat_dtype)
             else:
-                self.data.resize(self.data.shape[0]+NhalosPerFile[myfile])
+                self.data.resize(self.data.shape[0]+NhalosPerFile[myfile], refcheck=False)
 
             for name in self.data.dtype.names:
                 self.data[name][-NhalosPerFile[myfile]:]=thiscat[name]
@@ -894,7 +894,7 @@ class histories:
                         self.data = np.copy(np.frombuffer(bindata[28:], dtype=self.cat_dtype))
                     else:
                         thiscat = np.frombuffer(bindata[28:], dtype=self.cat_dtype)
-                        self.data.resize(self.data.shape[0]+len(thiscat))
+                        self.data.resize(self.data.shape[0]+len(thiscat), refcheck=False)
                         self.data[-len(thiscat):]=np.copy(thiscat)
                         del thiscat
 
@@ -918,7 +918,7 @@ class histories:
                         if self.Nbranches is None:
                             self.Nbranches = np.copy(Nbranches)
                         else:
-                            self.Nbranches.resize(self.Nbranches.shape[0]+Nthisblock)
+                            self.Nbranches.resize(self.Nbranches.shape[0]+Nthisblock, refcheck=False)
                             self.Nbranches[-Nthisblock:]=np.copy(Nbranches)
                         del Nbranches
 
@@ -939,7 +939,7 @@ class histories:
                     if self.data is None:
                         self.data = np.copy(thiscat)
                     else:
-                        self.data.resize(self.data.shape[0]+len(thiscat))
+                        self.data.resize(self.data.shape[0]+len(thiscat), refcheck=False)
                         self.data[-len(thiscat):]=np.copy(thiscat)
                     del thiscat
 
@@ -963,8 +963,8 @@ class histories:
                 else:
                     cNb=self.Nbranches.shape[0]
                     cTr=self.data.shape[0]
-                    self.data.resize(self.data.shape[0]+Bthisfile)
-                    self.Nbranches.resize(self.Nbranches.shape[0]+Tthisfile)
+                    self.data.resize(self.data.shape[0]+Bthisfile, refcheck=False)
+                    self.Nbranches.resize(self.Nbranches.shape[0]+Tthisfile, refcheck=False)
 
                 pos=12
                 while pos < FileLength:

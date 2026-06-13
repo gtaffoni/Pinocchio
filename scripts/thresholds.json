@@ -1,0 +1,44 @@
+{
+  "_comment": "PINOCCHIO validation thresholds — VALIDATION_METHODOLOGY.md v1.0 (2026-06-12). Values are STARTING POINTS: calibrate with --calibrate np1-vs-np2 before production use. [Decision Morgan] required to finalise algo-approx values after first real measurement.",
+  "_delta_posin": "Δposin (posizione lagrangiana iniziale, fissata dall'ID del picco) deve restare entro 'posin_max_ulp' ulp di float32 (rumore di storage). Esatto a Livello 0/1; al Livello 2 tollerato a pochi ulp. Un bug di frame/indicizzazione sposta posin di celle intere, ben oltre questa soglia.",
+
+  "gpu-fp": {
+    "_doc": "Profilo gpu-fp (C.2): solo riordino FP, output binario, pari np. Soglie strette. Da calibrare con banda np1-vs-np2.",
+    "f_match_core":        0.999,
+    "core_npart":          20,
+    "f_match_all":         0.99,
+    "f_mass_unmatched":    0.001,
+    "max_unmatched_npart": 100,
+    "frac_dnpart_zero":    0.95,
+    "p99_dnpart_rel":      0.02,
+    "median_dx_cells":     0.01,
+    "p99_dx_cells":        0.1,
+    "p99_dv_kms":          10.0,
+    "hmf_max_sigma":       0.2,
+    "hmf_sign_low":        0.2,
+    "hmf_sign_high":       0.8,
+    "merger_flip_rate":    0.001,
+    "tree_same_nbranches": 0.995,
+    "posin_max_ulp":       2
+  },
+
+  "algo-approx": {
+    "_doc": "Profilo algo-approx (C.2 nota): approssimazioni algoritmiche dichiarate (FastFrag, tiling, bordo). Soglie più ampie ma non oltre la banda MPI intrinseca np1-vs-np2. VALORI PROVVISORI — [Decisione Morgan] dopo prima misura reale con --calibrate.",
+    "f_match_core":        0.99,
+    "core_npart":          20,
+    "f_match_all":         0.97,
+    "f_mass_unmatched":    0.005,
+    "max_unmatched_npart": 100,
+    "frac_dnpart_zero":    0.85,
+    "p99_dnpart_rel":      0.05,
+    "median_dx_cells":     0.05,
+    "p99_dx_cells":        0.5,
+    "p99_dv_kms":          50.0,
+    "hmf_max_sigma":       1.0,
+    "hmf_sign_low":        0.1,
+    "hmf_sign_high":       0.9,
+    "merger_flip_rate":    0.01,
+    "tree_same_nbranches": 0.97,
+    "posin_max_ulp":       2
+  }
+}
