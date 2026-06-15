@@ -2,7 +2,7 @@
 
 **Versione:** 1.0 — 2026-06-12
 **Base di riferimento:** branch `feature/leonardo-radix` (heFFTe + radix sort), validato bit-identico rispetto a qsort su cataloghi, mass function, histories e PLC a np = 1/2/4 e OMP = 1/2/8.
-**Scopo:** dare a Morgan uno strumento indipendente, self-contained (Python + numpy), eseguibile su qualunque server (incluso il server GPU), che dopo ogni sviluppo (porting GPU, FastFrag, tiling a colori, ottimizzazioni) risponda alla domanda: *il nuovo codice produce gli stessi gruppi, con lo stesso numero di particelle, nelle stesse posizioni — o la differenza fisica è troppo grande?*
+**Scopo:** dare  uno strumento indipendente, self-contained (Python + numpy), eseguibile su qualunque server (incluso il server GPU), che dopo ogni sviluppo (porting GPU, FastFrag, tiling a colori, ottimizzazioni) risponda alla domanda: *il nuovo codice produce gli stessi gruppi, con lo stesso numero di particelle, nelle stesse posizioni — o la differenza fisica è troppo grande?*
 
 **Principio fondante (non negoziabile):** contare il numero di gruppi o di picchi NON basta. L'audit di FastFrag ha mostrato un caso reale in cui il numero di aloni e la mass function erano compatibili con il riferimento, ma le posizioni finali erano *tutte* sbagliate (output nel frame del sottovolume invece che nel frame globale). Un test basato solo su conteggi e HMF avrebbe dato PASS a un codice rotto. La validazione deve quindi essere **alone-per-alone**, sfruttando l'identificativo lagrangiano.
 
@@ -135,7 +135,7 @@ Per ogni coppia matched (stesso `name`):
 - **ΔNpart** = npart_cand − npart_ref. Statistiche: frazione con ΔNpart = 0; p99 di |ΔNpart|/npart_ref; max |ΔNpart| con npart ≥ 100. ΔNpart è la metrica più "dura": intero, niente rumore FP — misura direttamente se l'algoritmo di accrescimento/merging ha preso le stesse decisioni. (`Mass` è ridondante con npart × massa particella; si controlla la proporzionalità come consistenza interna.)
 - **|Δx|** = distanza tra `pos` con **convenzione di immagine minima** (il box è periodico: un alone a x = 0.01 e x = 299.99 in un box da 300 dista 0.02, non 299.98). Riportata in **unità di cella** Δg = BoxSize/GridSize e in Mpc/h. Statistiche: mediana, p99, max; scatter plot opzionale |Δx| vs npart.
 - **|Δv|** in km/s, e relativa |Δv|/|v|. Stesse statistiche. Le velocità sono derivate LPT degli stessi spostamenti: se le posizioni sono a posto e le velocità no, il bug è nel calcolo delle velocità (o nei fattori di crescita).
-- **Δposin**: deve essere *esattamente* zero a ogni livello — `posin` è la posizione lagrangiana, determinata dall'ID. Un Δposin ≠ 0 con stesso `name` è incoerenza interna del candidato (bug di indicizzazione), mai effetto FP. È un check quasi gratuito e molto potente contro errori di frame/indice (il bug FastFrag sarebbe stato preso anche da qui).
+- **Δposin** (check di frame): `posin` è la posizione lagrangiana iniziale dell'alone, una quantità *simile a un centro di massa* sulle posizioni iniziali delle particelle membro. A Livello 0/1 deve essere esatta. A Livello 2 (fisico/GPU) porta rumore floating-point: stesso codice+config ma compilatore diverso (es. **nvc vs gcc**: contrazione FMA, intrinseche math) o aritmetica GPU la spostano di pochi ulp float32 (**~1e-5 celle** misurate a Grid=64). Si misura quindi in **frazione di cella** con soglia `posin_max_cells` (default gpu-fp 1e-3): un bug di frame/indicizzazione sposta `posin` di **celle intere** (≥ 1, ~1e5 ulp), ordini di grandezza oltre la soglia. È un check quasi gratuito e molto potente contro errori di frame/indice (il bug FastFrag sarebbe stato preso anche da qui). Nota: il rumore FP di `posin` cresce lievemente con GridSize e con la dimensione degli aloni → ricalibrare per griglie di produzione grandi.
 
 ### B.3 Mass function bin-per-bin (per ogni redshift)
 
@@ -194,7 +194,7 @@ N_halos per z, N_trees, N_branches, N_plc: si riportano sempre, e una discrepanz
 | 10 | HMF | max \|r_i\| **≤ 0.2 σ_Poisson** (bin ≥ 50 aloni) e sign test con frazione positiva in [0.2, 0.8] | stesse IC ⇒ Poisson è tetto, non target (B.3); 0.2σ è già generoso quando f_match ≈ 1 |
 | 11 | merger-flip rate | **≤ 0.1 %** dei branch | i merger sono decisioni discrete su coppie; solo coppie al limite del criterio di vicinanza possono flippare |
 | 12 | tree matched con stesso Nbranches | **≥ 99.5 %** | segue da 2 e 11 |
-| 13 | Δposin sui match | **= 0 esatto, sempre** | proprietà lagrangiana determinata dall'ID: qualunque differenza è un bug di indicizzazione/frame, a qualunque livello |
+| 13 | Δposin sui match | **= 0** a L0/L1; **≤ `posin_max_cells`** (gpu-fp 1e-3 celle) a L2 | centro-di-massa lagrangiano: porta rumore FP cross-compilatore/GPU (~1e-5 celle); un bug di frame lo sposta di celle intere (≥1), ben oltre la soglia |
 
 Per il profilo `algo-approx` i valori delle righe 1–2, 5–8, 11 vanno rilassati **esplicitamente e singolarmente** in un file di soglie dedicato, con il vincolo C.4. **[Decisione Morgan]**: i valori `algo-approx` si fissano solo dopo aver visto la prima misura reale (es. FastFrag corretto) e la banda di calibrazione.
 
@@ -319,7 +319,7 @@ def periodic_delta(a, b, box):
 def catalog_metrics(cref, ccand, box, grid):
     """B.1 + B.2: f_match (globale e per bin npart), f_mass_unmatched,
     lista non-match npart>=100; sui match: ΔNpart (frac zero, p99 rel),
-    |Δx| in celle (mediana, p99, max), |Δv| (p99), Δposin (deve essere 0).
+    |Δx| in celle (mediana, p99, max), |Δv| (p99), Δposin in celle (frame check).
     Ritorna dict di numeri + tabelle per il report."""
 
 def hmf_metrics(mf_ref_file, mf_cand_file):
@@ -408,7 +408,7 @@ Non compila né lancia PINOCCHIO (a differenza di `HMF_validation.py`): separazi
 
 - **f_match che crolla** (sotto ~99 % core): il candidato sta costruendo gruppi diversi — bug di fragmentation, non FP.
 - **Δx con struttura sistematica**: stesso offset per molti aloni, o offset correlato con la posizione nel box ⇒ errore di frame/offset di sottovolume (esattamente il bug FastFrag); visibile immediatamente nell'istogramma per componente di Δx (non centrato su 0) e da Δposin ≠ 0.
-- **Δposin ≠ 0 su qualunque alone**: bug di indicizzazione, sempre (C.2 riga 13).
+- **Δposin oltre soglia (> `posin_max_cells`, default 1e-3 celle)**: bug di indicizzazione/frame (C.2 riga 13). Attenzione: un Δposin ≠ 0 ma di pochi ulp (~1e-5 celle) è solo rumore FP cross-compilatore/GPU, NON un bug — è il motivo per cui la soglia è sub-cella e non zero esatto.
 - **Non-match con npart ≥ 100**: gli oggetti grandi sono robusti; perderne uno significa che una regione intera è trattata diversamente (bordo, tile, trasferimento dati incompleto).
 - **HMF sistematicamente sopra/sotto** (sign test fuori banda) anche con residui piccoli: bias di soglia di collasso (es. precisione singola dove serviva doppia, costante fisica diversa, interpolazione GPU del tempo di collasso diversa da quella CPU).
 - **ΔNpart grandi su aloni grandi** con posizioni corrette: criterio di accrescimento alterato (es. confronto `d <= R` vs `d < R` su GPU, o raggio calcolato in precisione diversa).
