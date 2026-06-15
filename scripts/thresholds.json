@@ -1,6 +1,6 @@
 {
   "_comment": "PINOCCHIO validation thresholds — VALIDATION_METHODOLOGY.md v1.0 (2026-06-12). Values are STARTING POINTS: calibrate with --calibrate np1-vs-np2 before production use. [Decision Morgan] required to finalise algo-approx values after first real measurement.",
-  "_delta_posin": "Δposin (posizione lagrangiana iniziale, fissata dall'ID del picco) deve restare entro 'posin_max_ulp' ulp di float32 (rumore di storage). Esatto a Livello 0/1; al Livello 2 tollerato a pochi ulp. Un bug di frame/indicizzazione sposta posin di celle intere, ben oltre questa soglia.",
+  "_delta_posin": "Δposin (posizione lagrangiana iniziale dell'alone, simile a un centro di massa) deve restare entro 'posin_max_cells' celle di griglia. Esatto a Livello 0/1; al Livello 2 tollera il rumore floating-point (cross-compilatore es. nvc vs gcc, o GPU): ~1e-5 celle osservate a Grid=64. Il rumore cresce lievemente con GridSize e con la dimensione degli aloni (accumulo nella somma del centro di massa): per griglie di produzione grandi ricalibrare con --calibrate. Un bug di frame/indicizzazione sposta posin di celle INTERE (>=1), ordini di grandezza oltre la soglia.",
 
   "gpu-fp": {
     "_doc": "Profilo gpu-fp (C.2): solo riordino FP, output binario, pari np. Soglie strette. Da calibrare con banda np1-vs-np2.",
@@ -19,7 +19,7 @@
     "hmf_sign_high":       0.8,
     "merger_flip_rate":    0.001,
     "tree_same_nbranches": 0.995,
-    "posin_max_ulp":       2
+    "posin_max_cells":     0.001
   },
 
   "algo-approx": {
@@ -39,6 +39,6 @@
     "hmf_sign_high":       0.9,
     "merger_flip_rate":    0.01,
     "tree_same_nbranches": 0.97,
-    "posin_max_ulp":       2
+    "posin_max_cells":     0.01
   }
 }

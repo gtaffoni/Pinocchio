@@ -663,15 +663,20 @@ def catalog_metrics(cat_ref, cat_cand, box, grid, minhalo=10):
     p99_dv_kms = float(np.percentile(dv, 99)) if len(dv) > 0 else 0.0
     max_dv_kms = float(np.max(dv)) if len(dv) > 0 else 0.0
 
-    # Δposin — initial Lagrangian position, determined by the peak ID. Must be
-    # reproduced exactly at Level 0/1; at Level 2 (physical/GPU) it is tolerated to
-    # within float32 storage noise (~1-2 ulp). A real frame/indexing bug shifts it
-    # by whole cells (>> ulp), so a few-ulp tolerance still catches such bugs.
+    # Δposin — initial Lagrangian position of the halo (a centre-of-mass-like
+    # quantity over the member particles' initial positions). It must be reproduced
+    # exactly at Level 0/1. At Level 2 (physical/GPU) it carries floating-point
+    # noise: same code+config but a different compiler (e.g. nvc vs gcc, FMA
+    # contraction, math intrinsics) or GPU arithmetic shifts it by a few float32
+    # ulp (~1e-5 cells). A real frame/indexing bug instead shifts it by WHOLE cells
+    # (>= 1 cell ~ 1e5 ulp), so a sub-cell tolerance still catches such bugs.
     dposin3 = mc['posin'].astype(np.float64) - mr['posin'].astype(np.float64)
     dposin  = np.sqrt(np.sum(dposin3**2, axis=1))
     n_dposin_nonzero = int(np.sum(dposin != 0.0))
     max_dposin = float(np.max(dposin)) if len(dposin) > 0 else 0.0
-    # Worst per-component Δposin expressed in float32 ulp at the position scale
+    # Δposin in grid-cell units (grid-independent, physically interpretable) and,
+    # for info, in float32 ulp at the position scale.
+    max_dposin_cells = max_dposin / cell if cell > 0 else 0.0
     if len(dposin3) > 0:
         comp_abs = np.abs(dposin3)
         sp = np.spacing(np.abs(mr['posin']).astype(np.float32)).astype(np.float64)
@@ -715,6 +720,7 @@ def catalog_metrics(cat_ref, cat_cand, box, grid, minhalo=10):
         # Δposin (frame check)
         "n_dposin_nonzero":   n_dposin_nonzero,
         "max_dposin":         max_dposin,
+        "max_dposin_cells":   max_dposin_cells,
         "max_dposin_ulp":     max_dposin_ulp,
         "dposin_offenders":   dposin_offenders,
         # for calibrate / plots
@@ -1016,12 +1022,13 @@ def verdict(all_metrics, thresholds, ref_info):
         lines.append(line)
         if not passed: ok = False
 
-        # Δposin — frame/indexing check. Tolerated to a few float32 ulp (storage
-        # noise); a real frame bug moves posin by whole cells, far above this.
-        posin_tol = thr.get('posin_max_ulp', 2)
-        passed, line = _check(m['max_dposin_ulp'], posin_tol, "<=",
-                              f"dposin <= {posin_tol} ulp (frame check)")
-        lines.append(line + f"  [max={m['max_dposin']:.3e} Mpc/h, nonzero={m['n_dposin_nonzero']}]")
+        # Δposin — frame/indexing check, in grid-cell units. Tolerates floating-point
+        # noise (cross-compiler/GPU, ~1e-5 cells); a real frame bug moves posin by
+        # whole cells (>= 1), orders of magnitude above the threshold.
+        posin_tol = thr.get('posin_max_cells', 1e-3)
+        passed, line = _check(m['max_dposin_cells'], posin_tol, "<=",
+                              f"dposin <= {posin_tol:g} cells (frame check)")
+        lines.append(line + f"  [max={m['max_dposin']:.3e} Mpc/h = {m['max_dposin_ulp']:.0f} ulp]")
         if not passed:
             ok = False
             for off in m['dposin_offenders'][:3]:
