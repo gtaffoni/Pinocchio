@@ -211,8 +211,23 @@ int organize_main_memory()
   MPI_Reduce(&myNalloc, &Nalloc, 1, MPI_UNSIGNED, MPI_MIN, 0, MPI_COMM_WORLD);
   MPI_Bcast(&Nalloc, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
 
+  /* The fragmentation arena (sized by memory.frag_allocated) is carved buffer
+     by buffer, ALIGN-padding every sub-buffer (ALIGN_MEMORY_BLOCK after each).
+     The memory budget below must therefore include the same per-buffer padding,
+     otherwise the last sub-buffer (frag_map_update) spills past the arena and
+     create_map()'s memset triggers a heap-buffer-overflow.
+
+     (a) frag_prods: sizeof(product_data) is not a multiple of ALIGN, so the
+         ALIGN pad applied after the frag[] block (carving) must be budgeted. */
   memory.frag_prods  = Nalloc * sizeof(product_data);
-  memory.frag_arrays = Nalloc * FRAGFIELDS * sizeof(int);
+  ALIGN_MEMORY_BLOCK(memory.frag_prods);
+  /* (b) frag_arrays: each of the FRAGFIELDS int arrays is ALIGN-padded when
+         carved, exactly as already done for memory.groups. */
+  memory.frag_arrays = 0;
+  for (int frag_f = 0; frag_f < FRAGFIELDS; frag_f++) {
+      memory.frag_arrays += Nalloc * sizeof(int);
+      ALIGN_MEMORY_BLOCK(memory.frag_arrays);
+  }
   /* this is the memory occupied by fragmentation */
   memory.frag_allocated = memory.prods + memory.frag_prods + memory.groups + memory.frag_arrays
 #ifdef RECOMPUTE_DISPLACEMENTS
